@@ -217,100 +217,92 @@ def run_distributed_process(rank, world_size, cfg, model_path, expected_logits_p
     dist_config = DistributedConfig(rank, world_size, stage_ranks, tp_ranks_per_stage)
     dist_config.setup_groups()
 
+    # Determine Loaded Layers (Overlapping for Dynamic Test)
+    # Stage 0: 0-12 (12 layers: 0..11, plus overlap? Let's load 0-12 to be safe for 12 layers)
+    # Default split is 12, 12. 
+    # Stage 0 needs 0-11.
+    # Stage 1 needs 12-23.
+    # We want to test [10, 14].
+    # Stage 0 needs 0-9. (Subset of 0-11).
+    # Stage 1 needs 10-23. (Needs 10, 11 which are usually in Stage 0).
+    # So Stage 1 MUST load 10-23.
+    
+    if dist_config.stage_id == 0:
+        managed_layers_range = [0, 12] # Loads 0-11
+    else:
+        managed_layers_range = [10, 24] # Loads 10-23 (Includes 10, 11)
+
     # Initialize Distributed Model
-    model = DistributedQwen3Model(cfg, dist_config)
+    model = DistributedQwen3Model(cfg, dist_config, managed_layers_range=managed_layers_range)
     
     # Load Weights
     model.load_weights_from_hf(model_path)
     
-    local_kv = LocalKVCache(len(model.trf_blocks))
+    local_kv = LocalKVCache(len(model.trf_blocks)) # Size based on loaded layers
     
     model.eval()
     
     # Log role
-    print(f"Rank {rank}: Role = Stage {dist_config.stage_id}, TP Rank {dist_config.tp_rank}")
+    print(f"Rank {rank}: Role = Stage {dist_config.stage_id}, TP Rank {dist_config.tp_rank}, Loaded Layers {managed_layers_range}")
     
     with torch.no_grad():
         # Generate 10 tokens
         generated_ids = []
         curr_input = input_ids
+        current_pos = 0
+        
+        # Dynamic Schedule
+        # First 3 tokens: [12, 12] (Explicit)
+        # Next 3 tokens: None (Implicit fallback to [12, 12])
+        # Next 3 tokens: [10, 14] (Explicit switch)
+        # Last 1 token: None (Implicit fallback to [10, 14])
+        
+        layer_counts = [12, 12] # Initial default
         
         for step in range(10):
-            logits = model(curr_input, cache=local_kv)
+            runtime_counts = None
+            
+            if step == 0:
+                runtime_counts = [12, 12]
+                layer_counts = runtime_counts
+            elif step == 6:
+                runtime_counts = [10, 14]
+                layer_counts = runtime_counts
+                
+            if rank == 0:
+                print(f"Step {step}: Providing Runtime Counts: {runtime_counts} (Expected Active: {layer_counts})")
+            
+            logits = model(curr_input, cache=local_kv, runtime_layer_counts=runtime_counts, start_pos=current_pos)
             
             # Only last stage gets logits
+            next_token_tensor = torch.zeros(1, 1, dtype=torch.long)
+            
             if dist_config.is_last_stage and dist_config.tp_rank == 0:
                 next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
                 generated_ids.append(next_token.item())
-                curr_input = next_token # For next step, input is just new token
-                
-                # Broadcast next token to all ranks (so they know what to process next)
-                # In this pipeline, only Stage 0 needs the input.
-                # But we need to sync the loop?
-                # Actually, in Pipeline, Stage 0 needs the input.
-                # So Stage last must send back to Stage 0? Or User provides?
-                # For auto-regressive generation, usually the Controller (or all) knows the next token.
-                # Here we simplify:
-                # If we are doing "Generate 10 tokens", we need to feed back the token.
-                pass
-            
-            # Synchronization for next token generation
-            # We need to broadcast the `next_token` from Last Stage Rank 0 to First Stage Rank 0.
-            # Or simpler: Just broadcast to everyone.
-            
-            next_token_tensor = torch.zeros(1, 1, dtype=torch.long)
-            if dist_config.is_last_stage and dist_config.tp_rank == 0:
                 next_token_tensor[0, 0] = next_token
-            
-            # Broadcast is tricky with disjoint groups.
-            # We use a global broadcast if possible, or P2P.
-            # Global broadcast from rank 4 (last) to all.
-            src_rank = stage_ranks[-1][0] # First rank of last stage? No, TP rank 0 of last stage.
-            # In our config: Stage 1 has ranks [2, 3, 4]. TP rank 0 is Rank 2.
-            # Wait, `logits` are gathered at TP Rank 0?
-            # In DistributedQwen3Model.forward:
-            # "return output" (if last stage).
-            # Output of FFN is AllReduced. So ALL ranks in last stage have the logits?
-            # Let's check `DistributedTransformerBlock`:
-            # "dist.all_reduce(x_partial...)" -> Yes, x is synced.
-            # So all ranks in Last Stage have `x`.
-            # `out_head` is computed on `x`.
-            # If `out_head` is not split (it is full weight on last stage), then ALL ranks in last stage have valid logits.
-            
-            # So any rank in Last Stage has the token.
-            # We need to send it to Stage 0.
-            
-            # Let's pick Rank 4 (last rank) to broadcast or Rank 2.
-            # Let's use Rank 2 (first of Stage 1).
-            sender = 2
-            
-            # But wait, in the loop `curr_input` needs to be updated for the NEXT step.
-            # Stage 0 needs `curr_input`.
-            # So we broadcast from Sender to World.
-            # But `dist.broadcast` works on a group. Default is global.
+                
+            # Broadcast next token (Sync)
+            # Use Rank 2 (First rank of Last Stage) as source for simplicity in this topology
+            sender = 2 
             dist.broadcast(next_token_tensor, src=sender)
             
+            current_pos += curr_input.shape[1]
             curr_input = next_token_tensor
             
-    # Verify Final Logic (Check consistency on the first generated token logits)
-    if dist_config.is_last_stage and dist_config.tp_rank == 0:
-        expected = torch.load(expected_logits_path)
-        # Compare first step logits
-        # We need to save the first step logits in the loop above?
-        # Let's just compare the final logits of the FIRST forward pass.
-        # Rerun the first pass for verification
-        
+    # Verify Final Logic (Check consistency on the first generated token logits with SHIFTED config)
     dist.barrier()
     
-    # Re-run single step for consistency check
+    # Re-run single step for consistency check with [10, 14] split
+    print(f"Rank {rank}: Verifying consistency with [10, 14] split...")
     local_kv = LocalKVCache(len(model.trf_blocks))
     with torch.no_grad():
-        logits = model(input_ids, cache=local_kv)
+        logits = model(input_ids, cache=local_kv, runtime_layer_counts=[10, 14])
         
     if dist_config.is_last_stage and dist_config.tp_rank == 0:
         expected = torch.load(expected_logits_path)
         diff = (logits - expected).abs().max()
-        print(f"Rank {rank}: Max Difference = {diff.item()}")
+        print(f"Rank {rank}: Max Difference (Shifted [10, 14]) = {diff.item()}")
         if diff < 1e-3:
             print("Rank {}: SUCCESS! Output matches reference.".format(rank))
         else:
@@ -318,11 +310,7 @@ def run_distributed_process(rank, world_size, cfg, model_path, expected_logits_p
             
         # Decode generated ids
         if len(generated_ids) > 0:
-            # We need tokenizer here. But it's not passed.
-            # We can re-load it or just print IDs.
             print(f"Rank {rank}: Generated IDs: {generated_ids}")
-            # Try to decode if tokenizer is available (it's not in this process).
-            # We can return them or just print.
 
 
     dist.barrier()

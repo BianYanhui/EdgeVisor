@@ -455,32 +455,44 @@ class DistributedTransformerBlock(nn.Module):
         return x, next_cache
 
 class DistributedQwen3Model(nn.Module):
-    def __init__(self, cfg, dist_config: DistributedConfig):
+    def __init__(self, cfg, dist_config: DistributedConfig, managed_layers_range=None):
         super().__init__()
         self.cfg = cfg
         self.dist_config = dist_config
         
         # Determine layers for this stage
         total_layers = cfg["n_layers"]
-        # Simple static layer partitioning for Pipeline
-        # E.g. 2 stages.
-        num_stages = len(dist_config.stage_ranks)
-        layers_per_stage = total_layers // num_stages
-        remainder = total_layers % num_stages
         
-        # Calculate my layer range
-        start_layer = 0
-        for i in range(dist_config.stage_id):
-            start_layer += layers_per_stage + (1 if i < remainder else 0)
+        if managed_layers_range is not None:
+            # Manual override for managed layers (Loaded)
+            start_layer, end_layer = managed_layers_range
+            self.layer_start = start_layer
+            self.layer_end = end_layer
+            my_num_layers = end_layer - start_layer
+            self.my_layers = range(start_layer, end_layer)
+        else:
+            # Simple static layer partitioning for Pipeline (Default)
+            num_stages = len(dist_config.stage_ranks)
+            layers_per_stage = total_layers // num_stages
+            remainder = total_layers % num_stages
+            
+            # Calculate my layer range
+            start_layer = 0
+            for i in range(dist_config.stage_id):
+                start_layer += layers_per_stage + (1 if i < remainder else 0)
+            
+            my_num_layers = layers_per_stage + (1 if dist_config.stage_id < remainder else 0)
+            end_layer = start_layer + my_num_layers
+            
+            self.layer_start = start_layer
+            self.layer_end = end_layer
+            self.my_layers = range(start_layer, end_layer)
         
-        my_num_layers = layers_per_stage + (1 if dist_config.stage_id < remainder else 0)
-        end_layer = start_layer + my_num_layers
+        # Active layers (Dynamic Execution) - initially same as loaded
+        self.active_layer_start = self.layer_start
+        self.active_layer_end = self.layer_end
         
-        self.layer_start = start_layer
-        self.layer_end = end_layer
-        self.my_layers = range(start_layer, end_layer)
-        
-        print(f"Rank {dist_config.rank} (Stage {dist_config.stage_id}) managing layers {self.layer_start}-{self.layer_end-1}")
+        print(f"Rank {dist_config.rank} (Stage {dist_config.stage_id}) loading layers {self.layer_start}-{self.layer_end-1}")
 
         # Components
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
@@ -662,33 +674,46 @@ class DistributedQwen3Model(nn.Module):
         # For this demo, we simulate by checking a shared file or just passing
         pass
 
-    def forward(self, x_or_idx, cache=None):
-        # P2P Receive Input (if not first stage)
+    def forward(self, x_or_idx, cache=None, runtime_layer_counts=None, start_pos=None):
+        """
+        runtime_layer_counts: List of integers, e.g. [10, 12, 14], indicating layers per stage.
+        If provided, updates the active layer range for this forward pass.
+        start_pos: Current position in sequence (for RoPE/Mask). If None, inferred from cache.
+        """
+        # 0. Update Dynamic Execution Logic
+        if runtime_layer_counts is not None:
+            # Validate input
+            assert len(runtime_layer_counts) == len(self.dist_config.stage_ranks), \
+                f"Layer counts {len(runtime_layer_counts)} must match stage count {len(self.dist_config.stage_ranks)}"
+            
+            # Calculate my active range
+            active_start = 0
+            for i in range(self.dist_config.stage_id):
+                active_start += runtime_layer_counts[i]
+            
+            active_end = active_start + runtime_layer_counts[self.dist_config.stage_id]
+            
+            if active_start < self.layer_start or active_end > self.layer_end:
+                 # Warning: Requested active range exceeds loaded range.
+                 if active_start < self.layer_start:
+                     print(f"Rank {self.dist_config.rank} WARNING: Requested start {active_start} < Loaded start {self.layer_start}")
+                 if active_end > self.layer_end:
+                     print(f"Rank {self.dist_config.rank} WARNING: Requested end {active_end} > Loaded end {self.layer_end}")
+            
+            self.active_layer_start = active_start
+            self.active_layer_end = active_end
+            
+        # P2P Receive Input (if not first logical stage)
+        
         if self.dist_config.is_first_stage:
             if self.dist_config.tp_rank == 0:
-                # Assuming x_or_idx is input_ids (b, seq)
-                # We need to broadcast it to other TP ranks in Stage 0
-                # Because all TP ranks need input for Embedding?
-                # Actually, Embedding is usually TP-split (vocab split) or replicated.
-                # Here we replicate Embedding (load full weights).
-                # So all TP ranks need the input_ids.
                 x = self.tok_emb(x_or_idx)
             else:
-                # Receive broadcast from TP rank 0
-                # We need to know shape of input_ids to create buffer?
-                # Or broadcast the embedding output?
-                # Broadcasting embedding output (b, seq, dim) is expensive.
-                # Better to broadcast input_ids (b, seq).
-                # But x_or_idx is passed to forward.
-                # We assume the caller handles input distribution for Stage 0?
-                # Requirement: "Weights Distribution... Each device loads full weights"
-                # So we assume all ranks in Stage 0 have `x_or_idx`.
                 x = self.tok_emb(x_or_idx)
         else:
             # Receive from previous stage
             if self.dist_config.tp_rank == 0:
                 # Receive Metadata (Shape)
-                # Use a fixed tensor size for metadata
                 shape_tensor = torch.zeros(3, dtype=torch.long, device='cpu')
                 src_rank = self.dist_config.stage_ranks[self.dist_config.stage_id - 1][0]
                 dist.recv(shape_tensor, src=src_rank)
@@ -723,22 +748,22 @@ class DistributedQwen3Model(nn.Module):
         num_tokens = x.shape[1]
         
         # Mask setup
-        if cache is not None:
-            # We need to handle the case where cache might be initialized for the first time
-            pass 
+        # Infer start_pos if not provided
+        if start_pos is None:
+            start_pos = 0
+            if cache:
+                # Iterate over all loaded layers to find max length
+                # Because some layers might be empty if just activated
+                max_len = 0
+                for i in range(len(self.trf_blocks)):
+                    c = cache.get(i)
+                    if c and len(c) > 0 and c[0].numel() > 0:
+                        max_len = max(max_len, c[0].shape[2])
+                start_pos = max_len
         
-        # Simple mask for now (causal)
-        # Note: In real generation, we pass start_pos. 
-        # Here we simplify and assume cache handles pos.
-        # We need `start_pos` from somewhere. 
-        # For simplicity, we assume `cache` object tracks it or we infer from cache size.
-        
-        start_pos = 0
-        if cache and cache.get(0):
-             # Infer from first layer cache
-             # cache.get(0) returns (k, v)
-             k = cache.get(0)[0] # (b, n_kv, seq, dim)
-             start_pos = k.shape[2]
+        # Debug Print
+        # if self.dist_config.rank == 4:
+        #    print(f"Rank 4: start_pos={start_pos}, num_tokens={num_tokens}, mask_size={num_tokens+start_pos}")
              
         # Update current_pos logic if needed
         
@@ -747,20 +772,46 @@ class DistributedQwen3Model(nn.Module):
         )[start_pos : start_pos + num_tokens, : start_pos + num_tokens]
         mask = mask[None, None, :, :]
 
-        for i, block in enumerate(self.trf_blocks):
-            global_layer_idx = self.layer_start + i
+        # Iterate over ACTIVE layers only
+        
+        for global_layer_idx in range(self.active_layer_start, self.active_layer_end):
+            # Map global to local
+            if global_layer_idx < self.layer_start or global_layer_idx >= self.layer_end:
+                # Skip if not loaded (Should have warned)
+                continue
+                
+            local_idx = global_layer_idx - self.layer_start
+            block = self.trf_blocks[local_idx]
             
-            # Check for policy updates
-            # In a real async system, we would check a shared queue or flag.
-            # Here we assume the Controller calls `update_load_balance_policy` before forward.
+            blk_cache = cache.get(local_idx) if cache else None
             
-            blk_cache = cache.get(i) if cache else None
+            # Handle cold start or partial history for shifted layers
+            # If a layer was inactive in previous steps, its cache will be shorter than start_pos.
+            # We must adapt start_pos and mask for this layer to prevent size mismatch.
+            
+            current_cache_len = 0
+            if blk_cache and len(blk_cache) > 0 and blk_cache[0].numel() > 0:
+                current_cache_len = blk_cache[0].shape[2]
+            
+            if start_pos > current_cache_len:
+                 # Partial history / Cold start
+                 layer_start_pos = current_cache_len
+                 
+                 # Generate mask for this specific length
+                 # Mask size should match (num_tokens + layer_start_pos)
+                 layer_mask = torch.triu(
+                    torch.ones(num_tokens + layer_start_pos, num_tokens + layer_start_pos, device=x.device, dtype=torch.bool), diagonal=1
+                 )[layer_start_pos : layer_start_pos + num_tokens, : layer_start_pos + num_tokens]
+                 layer_mask = layer_mask[None, None, :, :]
+            else:
+                 layer_start_pos = start_pos
+                 layer_mask = mask
             
             # Forward Block
-            x, new_blk_cache = block(x, mask, self.cos, self.sin, start_pos=start_pos, cache=blk_cache)
+            x, new_blk_cache = block(x, layer_mask, self.cos, self.sin, start_pos=layer_start_pos, cache=blk_cache)
             
             if cache:
-                cache.update(i, new_blk_cache)
+                cache.update(local_idx, new_blk_cache)
 
         # 3. Output / Send
         if self.dist_config.is_last_stage:
