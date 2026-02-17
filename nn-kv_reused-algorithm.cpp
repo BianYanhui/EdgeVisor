@@ -72,51 +72,80 @@ std::vector<RebalanceMove> RebalanceHeadMoves(const std::vector<DeviceStatus>& d
         move_right = new_move_right;
     }
 
+    // Calculate FFN moves based on Head moves ratio (after scaling)
+    int ffn_move_left = 0;
+    int ffn_move_right = 0;
+    // Assuming src_dev has current_ffn_compute
+    const int current_ffn = src_dev.current_ffn_compute.count();
+    
+    if (current_heads > 0) {
+        double ratio_left = (double)move_left / current_heads;
+        double ratio_right = (double)move_right / current_heads;
+        ffn_move_left = (int)(current_ffn * ratio_left);
+        ffn_move_right = (int)(current_ffn * ratio_right);
+    }
+
     // 3. Apply KV-Cache constraints (do not mutate ranges here; just clamp moves)
     if (move_left > 0 && src_idx > 0) {
-        const auto& left_kv = devices[(size_t)(src_idx - 1)].kv_cache_holding;
-        const int current_L_end = devices[(size_t)(src_idx - 1)].current_compute.end;
+        const auto& left_kv = devices[(size_t)(src_idx - 1)].kv_head_holding;
+        const int current_L_end = devices[(size_t)(src_idx - 1)].current_head_compute.end;
         int max_possible = left_kv.end - current_L_end;
         if (max_possible < 0) max_possible = 0;
-        move_left = std::min(move_left, max_possible);
+        
+        if (move_left > max_possible) {
+            move_left = max_possible;
+            // Recalculate FFN move
+            if (current_heads > 0) {
+                double ratio_left = (double)move_left / current_heads;
+                ffn_move_left = (int)(current_ffn * ratio_left);
+            }
+        }
     }
 
     if (move_right > 0 && src_idx < (int)devices.size() - 1) {
-        const auto& right_kv = devices[(size_t)(src_idx + 1)].kv_cache_holding;
-        const int current_R_start = devices[(size_t)(src_idx + 1)].current_compute.start;
+        const auto& right_kv = devices[(size_t)(src_idx + 1)].kv_head_holding;
+        const int current_R_start = devices[(size_t)(src_idx + 1)].current_head_compute.start;
         int max_possible = current_R_start - right_kv.start;
         if (max_possible < 0) max_possible = 0;
-        move_right = std::min(move_right, max_possible);
+        
+        if (move_right > max_possible) {
+            move_right = max_possible;
+            // Recalculate FFN move
+            if (current_heads > 0) {
+                double ratio_right = (double)move_right / current_heads;
+                ffn_move_right = (int)(current_ffn * ratio_right);
+            }
+        }
     }
 
-    // Emit moves (head-only for now)
-    if (move_left > 0 && src_idx > 0) {
+    // Emit moves (head and FFN)
+    if ((move_left > 0 || ffn_move_left > 0) && src_idx > 0) {
         moves.push_back(RebalanceMove{
             /*from_device_id=*/src_dev.device_id,
             /*to_device_id=*/devices[(size_t)(src_idx - 1)].device_id,
             /*cmdKind=*/1,
             /*headMove=*/move_left,
-            /*ffnMove=*/0,
+            /*ffnMove=*/ffn_move_left,
         });
     }
 
-    if (move_right > 0 && src_idx < (int)devices.size() - 1) {
+    if ((move_right > 0 || ffn_move_right > 0) && src_idx < (int)devices.size() - 1) {
         moves.push_back(RebalanceMove{
             /*from_device_id=*/src_dev.device_id,
             /*to_device_id=*/devices[(size_t)(src_idx + 1)].device_id,
             /*cmdKind=*/1,
             /*headMove=*/move_right,
-            /*ffnMove=*/0,
+            /*ffnMove=*/ffn_move_right,
         });
     }
 
     return moves;
 }
 
-std::vector<HeadRange> RebalanceHeads(const std::vector<DeviceStatus>& devices) {
-    std::vector<HeadRange> new_ranges;
+std::vector<Range> RebalanceHeads(const std::vector<DeviceStatus>& devices) {
+    std::vector<Range> new_ranges;
     for (const auto& dev : devices) {
-        new_ranges.push_back(dev.current_compute);
+        new_ranges.push_back(dev.current_head_compute);
     }
 
     if (devices.empty()) return new_ranges;
@@ -127,7 +156,7 @@ std::vector<HeadRange> RebalanceHeads(const std::vector<DeviceStatus>& devices) 
     if (src_idx == -1) return new_ranges; // Should not happen in normal cases
 
     const auto& src_dev = devices[src_idx];
-    int current_heads = src_dev.current_compute.count();
+    int current_heads = src_dev.current_head_compute.count();
     
     // Prevent divide by zero if heads is 0, though unlikely in practice for active device
     if (current_heads == 0) return new_ranges;
@@ -145,7 +174,7 @@ std::vector<HeadRange> RebalanceHeads(const std::vector<DeviceStatus>& devices) 
     // --- Calculate Move to Left ---
     if (src_idx > 0) {
         const auto& left_dev = devices[src_idx - 1];
-        int l_heads = left_dev.current_compute.count();
+        int l_heads = left_dev.current_head_compute.count();
         double t_left_unit = (l_heads > 0) ? (left_dev.execution_time_ms / l_heads) : t_src_unit; // Fallback estimate
         
         // Only move if src is slower
@@ -160,7 +189,7 @@ std::vector<HeadRange> RebalanceHeads(const std::vector<DeviceStatus>& devices) 
     // --- Calculate Move to Right ---
     if (src_idx < (int)devices.size() - 1) {
         const auto& right_dev = devices[src_idx + 1];
-        int r_heads = right_dev.current_compute.count();
+        int r_heads = right_dev.current_head_compute.count();
         double t_right_unit = (r_heads > 0) ? (right_dev.execution_time_ms / r_heads) : t_src_unit;
         
         if (src_dev.execution_time_ms > right_dev.execution_time_ms) {
@@ -199,7 +228,7 @@ std::vector<HeadRange> RebalanceHeads(const std::vector<DeviceStatus>& devices) 
     // Constraint: New Left range must be within Left.kv_cache_holding.
     // Specifically, [Left.end + 1, Left.end + k] must be in Left.kv.
     if (move_left > 0 && src_idx > 0) {
-        const auto& left_kv = devices[src_idx - 1].kv_cache_holding;
+        const auto& left_kv = devices[src_idx - 1].kv_head_holding;
         int current_L_end = new_ranges[src_idx - 1].end;
         
         // Calculate max allowed overlap into Src's territory based on Left's KV
@@ -222,7 +251,7 @@ std::vector<HeadRange> RebalanceHeads(const std::vector<DeviceStatus>& devices) 
     // Constraint: New Right range must be within Right.kv_cache_holding.
     // Specifically, [Right.start - k, Right.start - 1] must be in Right.kv.
     if (move_right > 0 && src_idx < (int)devices.size() - 1) {
-        const auto& right_kv = devices[src_idx + 1].kv_cache_holding;
+        const auto& right_kv = devices[src_idx + 1].kv_head_holding;
         int current_R_start = new_ranges[src_idx + 1].start;
         
         // Calculate max allowed overlap into Src's territory based on Right's KV

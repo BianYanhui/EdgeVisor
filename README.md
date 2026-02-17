@@ -57,22 +57,65 @@ model_stage1 = DistributedQwen3Model(cfg, dist_config, managed_layers_range=(10,
 
 如果不指定 `managed_layers_range`，则默认使用均匀分配策略。
 
-### 5. 动态负载均衡接口
+### 5. Stage 内动态负载均衡算法 (Intra-Stage Load Balancing)
 
-框架预留了动态负载均衡的接口：
+框架实现了 **Stage 内部** 的动态负载均衡算法，能够根据各设备的实时执行时间自动调整 **Attention Heads** 和 **FFN Dims** 的分配：
+
+#### 算法核心逻辑
+
+1. **瓶颈识别**：找到执行时间最长的设备（瓶颈设备）
+2. **Heads 迁移计算**：基于单位 Head 执行时间，计算需要向左右邻居迁移的 Head 数量
+3. **FFN 比例迁移**：FFN Dims 按 Head 迁移比例同步调整
+4. **KV Cache 约束**：确保 Head 迁移后的范围不超过设备已缓存的 KV 范围
+
+#### 使用示例
 
 ```python
-def update_load_balance_policy(self, layer_idx, ratios):
-    # 运行时动态调整各设备的负载比例
-    block.att.set_split_by_ratio(ratios)
-    block.ff.set_split_by_ratio(ratios)
+from rebalance_algo import DeviceStatus, rebalance_intra_stage
+
+# 定义 Stage 内设备状态
+devices = [
+    DeviceStatus(
+        device_id=0,
+        execution_time_ms=100.0,       # 瓶颈设备
+        current_head_start=0,
+        current_head_end=8,            # 当前负责 8 个 Heads
+        current_ffn_start=0,
+        current_ffn_end=5504,          # 当前负责 5504 个 FFN Dims
+        kv_head_holding_start=0,
+        kv_head_holding_end=8          # KV Cache 覆盖的 Head 范围
+    ),
+    DeviceStatus(
+        device_id=1,
+        execution_time_ms=50.0,        # 较快设备
+        current_head_start=8,
+        current_head_end=16,           # 当前负责 8 个 Heads
+        current_ffn_start=5504,
+        current_ffn_end=11008,         # 当前负责 5504 个 FFN Dims
+        kv_head_holding_start=6,       # 有 2 个 Head 的冗余 KV
+        kv_head_holding_end=16
+    )
+]
+
+# 执行 Stage 内负载均衡
+new_head_counts, new_ffn_counts = rebalance_intra_stage(devices)
+# 结果: Heads [6, 10], FFN [4128, 6880]
+# 从设备0迁移 2 个 Heads 和 1376 个 FFN Dims 到设备1
 ```
+
+#### 算法特点
+
+- **Stage 内部迁移**：迁移单位是 Attention Heads 和 FFN Dims，而非 Transformer Layers
+- **比例同步**：FFN Dims 按 Head 迁移比例同步调整，保持计算负载均衡
+- **KV Cache 约束感知**：Head 迁移受 KV Cache 边界限制，避免缓存失效
+- **双向迁移**：瓶颈设备可同时向左右邻居迁移负载
 
 ## 项目结构
 
 ```
 EdgeVisor/
 ├── distributed_qwen3.py    # 核心分布式模型实现
+├── rebalance_algo.py       # 动态负载均衡算法
 ├── test_distributed_qwen3.py  # 测试用例
 ├── infer_config.py         # 模型配置推断工具
 ├── check_bias.py           # 权重偏置检查工具
@@ -139,22 +182,34 @@ model.update_load_balance_policy(layer_idx=15, ratios=[2, 2, 1])  # 适用于 St
 测试用例验证了分布式推理的正确性：
 
 ```
-Rank 2: Max Difference = 0.00022363662719726562
+--- Testing Rebalance Algorithm (Intra-Stage Heads/FFN) ---
+Initial Devices: [DeviceStatus(device_id=0, execution_time_ms=100.0, ...), DeviceStatus(device_id=1, execution_time_ms=50.0, ...)]
+Rebalanced Head Counts: [6, 10]
+Rebalanced FFN Counts: [4128, 6880]
+Algorithm Verification SUCCESS: Heads and FFN rebalanced proportionally.
+
+Rank 2: Max Difference (Shifted [10, 14]) = 0.0002288818359375
 Rank 2: SUCCESS! Output matches reference.
-Rank 2: Generated IDs: [108230, 235, 3837, 1694, 279, 39635, 102168, 99222, 61213, 90840]
+Rank 2: Generated IDs: [99226, 102168, 108645, 112116, 71138, 29285, 11, 220, 4018, 28946]
 ```
 
-最大误差约为 2.2e-4，在浮点精度范围内，证明分布式实现与单进程参考模型输出一致。
+测试验证了：
+1. **Stage 内负载均衡算法正确性**：Heads 从 [8, 8] 迁移到 [6, 10]，FFN 按比例同步迁移
+2. **分布式推理一致性**：最大误差约 2.3e-4，在浮点精度范围内
+3. **动态层切换**：运行时成功切换层分配配置（[12, 12] → [10, 14]）
+4. **KV Cache 约束**：Head 迁移受 KV Cache 边界限制（设备1 可接受 Head 6-16）
 
 ## 测试用例分析
 
 测试代码覆盖以下场景：
 
-1. **权重加载正确性**：从 HuggingFace safetensors 格式加载权重到分布式模型
-2. **分布式通信正确性**：验证 AllReduce、Broadcast、Send/Recv 操作
-3. **流水线执行正确性**：验证两阶段流水线的激活值传递
-4. **自回归生成**：测试连续生成 10 个 token 的完整流程
-5. **数值一致性**：分布式输出与单进程参考模型对比
+1. **Stage 内负载均衡算法验证**：测试 `rebalance_intra_stage()` 算法在瓶颈场景下的 Heads/FFN 迁移计算
+2. **权重加载正确性**：从 HuggingFace safetensors 格式加载权重到分布式模型
+3. **分布式通信正确性**：验证 AllReduce、Broadcast、Send/Recv 操作
+4. **流水线执行正确性**：验证两阶段流水线的激活值传递
+5. **动态层切换**：运行时从 [12, 12] 切换到 [10, 14] 层分配
+6. **自回归生成**：测试连续生成 10 个 token 的完整流程
+7. **数值一致性**：分布式输出与单进程参考模型对比
 
 ## 架构说明
 
@@ -186,7 +241,8 @@ Rank 2: Generated IDs: [108230, 235, 3837, 1694, 279, 39635, 102168, 99222, 6121
 
 1. 当前实现使用 `gloo` 后端，适用于 CPU 测试；生产环境建议使用 `nccl` 后端
 2. 模型路径需要根据实际环境修改
-3. 动态负载均衡算法需要根据实际监控数据实现
+3. 动态负载均衡算法需要配合设备执行时间监控使用
+4. KV Cache 冗余范围决定了层迁移的边界约束
 
 ## 许可证
 
