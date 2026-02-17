@@ -43,7 +43,21 @@ block.att.set_active_heads([0, 2])
 - **阶段内张量并行**：每个阶段内部使用张量并行，支持不同 TP 度
 - **P2P 通信**：阶段间通过 `dist.send/recv` 传递激活值
 
-### 4. 动态负载均衡接口
+### 4. 自定义层划分 (Custom Layer Partitioning)
+
+支持非均匀的层划分，可以根据各 Stage 设备的计算能力灵活分配不同数量的层：
+
+```python
+# Stage 0: 负责 layers 0-9 (10层) - 算力较弱的设备
+model_stage0 = DistributedQwen3Model(cfg, dist_config, managed_layers_range=(0, 10))
+
+# Stage 1: 负责 layers 10-35 (26层) - 算力较强的设备
+model_stage1 = DistributedQwen3Model(cfg, dist_config, managed_layers_range=(10, 36))
+```
+
+如果不指定 `managed_layers_range`，则默认使用均匀分配策略。
+
+### 5. 动态负载均衡接口
 
 框架预留了动态负载均衡的接口：
 
