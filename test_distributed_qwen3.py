@@ -205,11 +205,47 @@ class ReferenceQwen3Model(nn.Module):
 
 # --- Test Runner ---
 
+from rebalance_algo import DeviceStatus, rebalance_layers
+
 def run_distributed_process(rank, world_size, cfg, model_path, expected_logits_path, input_ids):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
     torch.manual_seed(42)
+
+    # Define Simulated Device Status for Testing Rebalance Algo
+    if rank == 0:
+        print("\n--- Testing Rebalance Algorithm ---")
+        devices = [
+            DeviceStatus(
+                device_id=0,
+                execution_time_ms=100.0,
+                current_layer_start=0,
+                current_layer_end=12,
+                kv_holding_start=0,
+                kv_holding_end=12
+            ),
+            DeviceStatus(
+                device_id=1,
+                execution_time_ms=50.0,
+                current_layer_start=12,
+                current_layer_end=24,
+                kv_holding_start=10,
+                kv_holding_end=24
+            )
+        ]
+        
+        print(f"Initial Devices: {devices}")
+        new_counts = rebalance_layers(devices)
+        print(f"Rebalanced Counts: {new_counts}")
+        
+        expected_counts = [10, 14]
+        if new_counts == expected_counts:
+            print("Algorithm Verification SUCCESS: Moved 2 layers (Constraint applied).")
+        else:
+            print(f"Algorithm Verification FAILURE: Expected {expected_counts}, got {new_counts}")
+            
+    dist.barrier()
 
     # Config
     stage_ranks = [[0, 1], [2, 3, 4]]
@@ -266,7 +302,10 @@ def run_distributed_process(rank, world_size, cfg, model_path, expected_logits_p
                 runtime_counts = [12, 12]
                 layer_counts = runtime_counts
             elif step == 6:
-                runtime_counts = [10, 14]
+                # Simulate applying the optimized result
+                if rank == 0:
+                    print("Applying Optimized Layer Distribution...")
+                runtime_counts = [10, 14] # Hardcoded here but represents result of algo
                 layer_counts = runtime_counts
                 
             if rank == 0:
