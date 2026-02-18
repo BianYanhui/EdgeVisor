@@ -6,6 +6,8 @@ import time
 import os
 from collections import deque
 
+from rebalance_algo import DeviceStatus, rebalance_intra_stage
+
 # --- Configuration & Helpers ---
 
 def get_rank():
@@ -373,6 +375,10 @@ class DistributedFeedForward(nn.Module):
             end = self.hidden_dim
         self.active_hidden_indices = list(range(start, end))
         
+    def set_active_range(self, start, end):
+        """Set the dynamic active range of hidden dims this device computes."""
+        self.active_hidden_indices = list(range(start, end))
+
     def set_split_by_ratio(self, ratios):
         total_ratio = sum(ratios)
         cumulative = 0
@@ -419,7 +425,7 @@ class DistributedTransformerBlock(nn.Module):
         self.norm2 = RMSNorm(cfg["emb_dim"], eps=1e-6)
         self.tp_group = dist_config.tp_group
 
-    def forward(self, x, mask, cos, sin, start_pos=0, cache=None):
+    def forward(self, x, mask, cos, sin, start_pos=0, cache=None, skip_final_allreduce=False):
         # Attention Block
         shortcut = x
         x_norm = self.norm1(x)
@@ -442,17 +448,20 @@ class DistributedTransformerBlock(nn.Module):
         
         x_partial = self.ff(x_norm)
         
-        # AllReduce
+        # AllReduce (Conditional for last layer)
         if self.dist_config.tp_size > 1:
-            dist.all_reduce(x_partial, op=dist.ReduceOp.SUM, group=self.tp_group)
-            
-        x = x_partial + shortcut
-        
-        t1 = time.time()
-        # Logging time (mock)
-        # print(f"Rank {self.dist_config.rank} Layer Time: {t1-t0:.4f}s")
-        
-        return x, next_cache
+            if not skip_final_allreduce:
+                dist.all_reduce(x_partial, op=dist.ReduceOp.SUM, group=self.tp_group)
+                x = x_partial + shortcut
+                return x, None, next_cache
+            else:
+                # Return partial FFN output and shortcut separately
+                # The caller (Model) will handle the Reduce-to-Root and addition
+                return x_partial, shortcut, next_cache
+        else:
+            # TP=1
+            x = x_partial + shortcut
+            return x, None, next_cache
 
 class DistributedQwen3Model(nn.Module):
     def __init__(self, cfg, dist_config: DistributedConfig, managed_layers_range=None):
@@ -517,17 +526,32 @@ class DistributedQwen3Model(nn.Module):
         
         self.current_pos = 0
         
-        # Dynamic Load Balancing Hook
-        self.load_balance_queue = deque()
-
-    def update_load_balance_policy(self, layer_idx, ratios):
-        if self.layer_start <= layer_idx < self.layer_end:
-            local_idx = layer_idx - self.layer_start
-            block = self.trf_blocks[local_idx]
-            # Requirement: "Policy applied to next layer immediately"
-            # Here we just update the split ratio.
-            block.att.set_split_by_ratio(ratios)
-            block.ff.set_split_by_ratio(ratios)
+        # --- Dynamic Load Balancing State ---
+        self.tp_size = dist_config.tp_size
+        self.tp_rank = dist_config.tp_rank
+        
+        # Initial Counts (Even Split)
+        self.head_counts = [cfg["n_heads"] // self.tp_size] * self.tp_size
+        for i in range(cfg["n_heads"] % self.tp_size):
+            self.head_counts[i] += 1
+            
+        self.ffn_counts = [cfg["hidden_dim"] // self.tp_size] * self.tp_size
+        for i in range(cfg["hidden_dim"] % self.tp_size):
+            self.ffn_counts[i] += 1
+            
+        # KV Holding is static and same as initial head split
+        self.kv_head_counts = list(self.head_counts) 
+        
+        # Helper to compute ranges
+        def counts_to_ranges(counts):
+            ranges = []
+            start = 0
+            for c in counts:
+                ranges.append((start, start + c))
+                start += c
+            return ranges
+            
+        self.kv_ranges = counts_to_ranges(self.kv_head_counts)
 
     def load_weights_from_hf(self, model_path):
         """
@@ -654,33 +678,34 @@ class DistributedQwen3Model(nn.Module):
             if self.dist_config.is_last_stage:
                 assign(self.out_head.weight, tensor)
 
-    def load_balance_algorithm(self, layer_idx, step_stats):
-        """
-        Placeholder for load balancing algorithm.
-        Input: step_stats (execution time, etc.)
-        Output: New ratios or None (no change)
-        """
-        # Simple Logic: If Rank 0 is slower, give it less work.
-        # This runs on Root (Rank 0 global usually) or a dedicated controller.
-        # For this demo, we can implement a simple heuristic.
-        pass
+    def apply_load_balance_policy(self):
+        """Apply current head_counts and ffn_counts to all blocks."""
+        # Calculate my range based on tp_rank and counts
+        my_head_start = sum(self.head_counts[:self.tp_rank])
+        my_head_end = my_head_start + self.head_counts[self.tp_rank]
+        
+        my_ffn_start = sum(self.ffn_counts[:self.tp_rank])
+        my_ffn_end = my_ffn_start + self.ffn_counts[self.tp_rank]
+        
+        active_heads = list(range(my_head_start, my_head_end))
+        
+        for block in self.trf_blocks:
+            # Apply to Attention
+            block.att.set_active_heads(active_heads)
+            # Apply to FFN
+            block.ff.set_active_range(my_ffn_start, my_ffn_end)
 
-    def check_for_policy_updates(self):
-        """
-        Check for new load balancing policies from Root.
-        Non-blocking.
-        """
-        # In a real implementation, this would use dist.irecv
-        # For this demo, we simulate by checking a shared file or just passing
-        pass
-
-    def forward(self, x_or_idx, cache=None, runtime_layer_counts=None, start_pos=None):
+    def forward(self, x_or_idx, cache=None, runtime_layer_counts=None, start_pos=None, force_rebalance=False):
         """
         runtime_layer_counts: List of integers, e.g. [10, 12, 14], indicating layers per stage.
         If provided, updates the active layer range for this forward pass.
         start_pos: Current position in sequence (for RoPE/Mask). If None, inferred from cache.
+        force_rebalance: If True, forces a rebalance check (simulated imbalance).
         """
-        # 0. Update Dynamic Execution Logic
+        # 0. Apply Dynamic Load Balancing Strategy
+        self.apply_load_balance_policy()
+        
+        # 1. Update Dynamic Execution Logic (Layer Range)
         if runtime_layer_counts is not None:
             # Validate input
             assert len(runtime_layer_counts) == len(self.dist_config.stage_ranks), \
@@ -693,18 +718,10 @@ class DistributedQwen3Model(nn.Module):
             
             active_end = active_start + runtime_layer_counts[self.dist_config.stage_id]
             
-            if active_start < self.layer_start or active_end > self.layer_end:
-                 # Warning: Requested active range exceeds loaded range.
-                 if active_start < self.layer_start:
-                     print(f"Rank {self.dist_config.rank} WARNING: Requested start {active_start} < Loaded start {self.layer_start}")
-                 if active_end > self.layer_end:
-                     print(f"Rank {self.dist_config.rank} WARNING: Requested end {active_end} > Loaded end {self.layer_end}")
-            
             self.active_layer_start = active_start
             self.active_layer_end = active_end
             
         # P2P Receive Input (if not first logical stage)
-        
         if self.dist_config.is_first_stage:
             if self.dist_config.tp_rank == 0:
                 x = self.tok_emb(x_or_idx)
@@ -753,7 +770,6 @@ class DistributedQwen3Model(nn.Module):
             start_pos = 0
             if cache:
                 # Iterate over all loaded layers to find max length
-                # Because some layers might be empty if just activated
                 max_len = 0
                 for i in range(len(self.trf_blocks)):
                     c = cache.get(i)
@@ -761,23 +777,19 @@ class DistributedQwen3Model(nn.Module):
                         max_len = max(max_len, c[0].shape[2])
                 start_pos = max_len
         
-        # Debug Print
-        # if self.dist_config.rank == 4:
-        #    print(f"Rank 4: start_pos={start_pos}, num_tokens={num_tokens}, mask_size={num_tokens+start_pos}")
-             
-        # Update current_pos logic if needed
-        
         mask = torch.triu(
             torch.ones(num_tokens + start_pos, num_tokens + start_pos, device=x.device, dtype=torch.bool), diagonal=1
         )[start_pos : start_pos + num_tokens, : start_pos + num_tokens]
         mask = mask[None, None, :, :]
 
+        # Start Timing
+        t_start = time.time()
+
         # Iterate over ACTIVE layers only
-        
         for global_layer_idx in range(self.active_layer_start, self.active_layer_end):
             # Map global to local
             if global_layer_idx < self.layer_start or global_layer_idx >= self.layer_end:
-                # Skip if not loaded (Should have warned)
+                # Skip if not loaded
                 continue
                 
             local_idx = global_layer_idx - self.layer_start
@@ -785,20 +797,13 @@ class DistributedQwen3Model(nn.Module):
             
             blk_cache = cache.get(local_idx) if cache else None
             
-            # Handle cold start or partial history for shifted layers
-            # If a layer was inactive in previous steps, its cache will be shorter than start_pos.
-            # We must adapt start_pos and mask for this layer to prevent size mismatch.
-            
+            # Handle cold start or partial history
             current_cache_len = 0
             if blk_cache and len(blk_cache) > 0 and blk_cache[0].numel() > 0:
                 current_cache_len = blk_cache[0].shape[2]
             
             if start_pos > current_cache_len:
-                 # Partial history / Cold start
                  layer_start_pos = current_cache_len
-                 
-                 # Generate mask for this specific length
-                 # Mask size should match (num_tokens + layer_start_pos)
                  layer_mask = torch.triu(
                     torch.ones(num_tokens + layer_start_pos, num_tokens + layer_start_pos, device=x.device, dtype=torch.bool), diagonal=1
                  )[layer_start_pos : layer_start_pos + num_tokens, : layer_start_pos + num_tokens]
@@ -807,17 +812,106 @@ class DistributedQwen3Model(nn.Module):
                  layer_start_pos = start_pos
                  layer_mask = mask
             
-            # Forward Block
-            x, new_blk_cache = block(x, layer_mask, self.cos, self.sin, start_pos=layer_start_pos, cache=blk_cache)
+            # Optimization: Skip final AllReduce for the last active layer
+            is_last_active = (global_layer_idx == self.active_layer_end - 1)
+            skip_final = is_last_active and self.tp_size > 1
+            
+            x, shortcut, new_blk_cache = block(x, layer_mask, self.cos, self.sin, start_pos=layer_start_pos, cache=blk_cache, skip_final_allreduce=skip_final)
             
             if cache:
                 cache.update(local_idx, new_blk_cache)
+                
+            if skip_final:
+                # Reduce to Root (x is partial FFN)
+                dist.reduce(x, dst=self.dist_config.stage_ranks[self.dist_config.stage_id][0], op=dist.ReduceOp.SUM, group=self.dist_config.tp_group)
+                if self.dist_config.tp_rank == 0:
+                    x = x + shortcut
+                else:
+                    x = None
 
-        # 3. Output / Send
+        t_end = time.time()
+        exec_time = (t_end - t_start) * 1000.0 # ms
+        
+        if force_rebalance:
+            # Fake imbalance
+            if self.tp_rank == 0: exec_time = 100.0
+            else: exec_time = 50.0
+
+        # 3. Dynamic Load Balancing (Post-Run)
+        # Root gathers times and updates policy
+        if self.tp_size > 1:
+            times = [torch.zeros(1, device=x.device if x is not None else 'cpu') for _ in range(self.tp_size)]
+            my_time = torch.tensor([exec_time], device=x.device if x is not None else 'cpu')
+            
+            dist.all_gather(times, my_time, group=self.dist_config.tp_group)
+            times_ms = [t.item() for t in times]
+            
+            if self.tp_rank == 0:
+                # Root runs algorithm
+                devices = []
+                # Reconstruct current ranges for the algorithm input
+                # Use self.head_counts/ffn_counts directly as they track current state
+                curr_h = 0
+                curr_f = 0
+                for r in range(self.tp_size):
+                    # Heads
+                    h_count = self.head_counts[r]
+                    h_range = (curr_h, curr_h + h_count)
+                    curr_h += h_count
+                    
+                    # FFN
+                    f_count = self.ffn_counts[r]
+                    f_range = (curr_f, curr_f + f_count)
+                    curr_f += f_count
+                    
+                    d = DeviceStatus(
+                        device_id=r,
+                        execution_time_ms=times_ms[r],
+                        current_head_start=h_range[0],
+                        current_head_end=h_range[1],
+                        current_ffn_start=f_range[0],
+                        current_ffn_end=f_range[1],
+                        kv_head_holding_start=self.kv_ranges[r][0],
+                        kv_head_holding_end=self.kv_ranges[r][1]
+                    )
+                    devices.append(d)
+                
+                new_head_counts, new_ffn_counts = rebalance_intra_stage(devices)
+                
+                # Check for change
+                if new_head_counts != self.head_counts or new_ffn_counts != self.ffn_counts:
+                    print(f"Stage {self.dist_config.stage_id} Rebalance Triggered!")
+                    print(f"  Old Heads: {self.head_counts}, New Heads: {new_head_counts}")
+                    print(f"  Old FFN: {self.ffn_counts}, New FFN: {new_ffn_counts}")
+                
+                if not new_head_counts: # Safety
+                    new_head_counts = self.head_counts
+                    new_ffn_counts = self.ffn_counts
+                    
+                self.head_counts = new_head_counts
+                self.ffn_counts = new_ffn_counts
+                
+                # Broadcast
+                counts_tensor = torch.tensor(self.head_counts + self.ffn_counts, device=x.device if x is not None else 'cpu', dtype=torch.long)
+            else:
+                counts_tensor = torch.zeros(self.tp_size * 2, device=x.device if x is not None else 'cpu', dtype=torch.long)
+            
+            dist.broadcast(counts_tensor, src=self.dist_config.stage_ranks[self.dist_config.stage_id][0], group=self.dist_config.tp_group)
+            
+            counts_list = counts_tensor.tolist()
+            self.head_counts = counts_list[:self.tp_size]
+            self.ffn_counts = counts_list[self.tp_size:]
+
+        # 4. Output / Send
         if self.dist_config.is_last_stage:
-            x = self.final_norm(x)
-            logits = self.out_head(x)
-            return logits
+            if self.dist_config.tp_rank == 0:
+                # Root computes output
+                # x might be on CPU if previous step failed? No, x is None on non-root.
+                x = self.final_norm(x)
+                logits = self.out_head(x)
+                return logits
+            else:
+                return None
         else:
             # Send to next stage
             if self.dist_config.tp_rank == 0:
@@ -825,7 +919,7 @@ class DistributedQwen3Model(nn.Module):
                 # Send shape
                 shape_tensor = torch.tensor(x.shape, dtype=torch.long, device='cpu')
                 dist.send(shape_tensor, dst=dst_rank)
-                # Send data (move to CPU to avoid CUDA IPC issues with Gloo? Gloo handles CPU tensors best)
+                # Send data
                 dist.send(x.cpu(), dst=dst_rank)
             return None
 
