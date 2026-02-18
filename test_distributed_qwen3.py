@@ -367,6 +367,14 @@ def run_distributed_process(rank, world_size, cfg, model_path, expected_logits_p
         # Decode generated ids
         if len(generated_ids) > 0:
             print(f"Rank {rank}: Generated IDs: {generated_ids}")
+            try:
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                full_ids = input_ids[0].tolist() + generated_ids
+                text = tokenizer.decode(full_ids, skip_special_tokens=True)
+                print(f"Rank {rank}: Full Generated Text: '{text}'")
+            except Exception as e:
+                print(f"Rank {rank}: Failed to decode text: {e}")
 
 
     dist.barrier()
@@ -404,14 +412,14 @@ def main():
     
     # Inferred Config (since config.json is missing or unreliable)
     # Based on infer_config.py output:
-    # vocab_size: 151936, emb_dim: 896, n_layers: 24, n_heads: 7, n_kv_groups: 1, head_dim: 128, hidden_dim: 4864
+    # vocab_size: 151936, emb_dim: 896, n_layers: 24, n_heads: 14, n_kv_groups: 2, head_dim: 64, hidden_dim: 4864
     cfg = {
         "vocab_size": 151936,
         "emb_dim": 896,
         "n_layers": 24,
-        "n_heads": 7,
-        "n_kv_groups": 1, # MQA
-        "head_dim": 128,
+        "n_heads": 14,
+        "n_kv_groups": 2, # GQA
+        "head_dim": 64,
         "hidden_dim": 4864,
         "dtype": torch.float32, 
         "rope_base": 1000000.0, # Default for Qwen2.5/3 usually
@@ -425,7 +433,7 @@ def main():
     print("Loading Tokenizer...")
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        text = "Hello world"
+        text = "you are a good person with"
         input_ids = tokenizer(text, return_tensors="pt").input_ids
         print(f"Input: '{text}' -> IDs: {input_ids}")
     except Exception as e:
@@ -434,12 +442,36 @@ def main():
         input_ids = torch.tensor([[9707, 1879, 374, 264, 1279]], dtype=torch.long)
         print(f"Using dummy input ids: {input_ids}")
 
-    print("Generating Reference Output (Single Process)...")
-    ref_model = ReferenceQwen3Model(cfg)
-    ref_model.load_weights_from_hf(model_path)
-    
-    with torch.no_grad():
-        expected_logits = ref_model(input_ids)
+    print("Generating Reference Output (HF AutoModel)...")
+    try:
+        from transformers import AutoModelForCausalLM
+        hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.float32, device_map="cpu")
+        with torch.no_grad():
+            hf_output = hf_model(input_ids)
+            expected_logits = hf_output.logits
+        print("HF Reference Logits Generated.")
+        
+        # Verify Manual Ref Model against HF
+        print("Verifying Manual Reference Model against HF...")
+        ref_model = ReferenceQwen3Model(cfg)
+        ref_model.load_weights_from_hf(model_path)
+        with torch.no_grad():
+            manual_logits = ref_model(input_ids)
+            
+        diff = (manual_logits - expected_logits).abs().max()
+        print(f"Manual Ref Model vs HF Model Diff: {diff.item()}")
+        if diff > 1e-3:
+            print("WARNING: Manual Reference Model does NOT match HF Model!")
+        else:
+            print("Manual Reference Model matches HF Model.")
+            
+    except Exception as e:
+        print(f"Failed to load HF Model for verification: {e}")
+        print("Falling back to Manual Reference Model...")
+        ref_model = ReferenceQwen3Model(cfg)
+        ref_model.load_weights_from_hf(model_path)
+        with torch.no_grad():
+            expected_logits = ref_model(input_ids)
         
     torch.save(expected_logits, "expected_logits.pt")
     
