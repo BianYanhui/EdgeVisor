@@ -1,0 +1,24 @@
+{
+    "devices": [
+        {"id": 0, "compute": 100.0, "memory": 16.0},
+        {"id": 1, "compute": 90.0, "memory": 16.0}
+    ],
+    "links": [
+        {"src": 0, "dst": 1, "bandwidth": 10.0},
+        {"src": 1, "dst": 0, "bandwidth": 10.0}
+    ],
+    "rragc": {
+        "K": 2,
+        "P_min": 10.0,
+        "M_min": 1.0
+    },
+    "model": {
+        "total_layers": 4,
+        "activation_size_gb": 0.5
+    },
+    "layer_task": {
+        "input_bytes": 1048576,
+        "output_bytes": 1048576,
+        "total_flops": 1000000000.0
+    }
+}
