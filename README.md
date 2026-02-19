@@ -175,13 +175,51 @@ new_head_counts, new_ffn_counts = rebalance_intra_stage(devices)
 - **KV Cache 约束感知**：Head 迁移受 KV Cache 边界限制
 - **双向迁移**：瓶颈设备可同时向左右邻居迁移负载
 
+### 7. Stage 间动态负载均衡 (Inter-Stage Dynamic Load Balancing)
+
+框架实现了 **Stage 之间** 的动态层迁移，能够根据各 Stage 的实时执行时间自动调整 **Transformer Layers** 的分配：
+
+#### IBSA: Inter-VG Bottleneck Smoothing Algorithm
+
+IBSA 算法通过在相邻 Stage 之间迁移 Layer 来降低 Pipeline 瓶颈延迟：
+
+1. **识别瓶颈**：找到执行时间最长的 Stage
+2. **邻居搜索**：找到瓶颈 Stage 的最快邻居
+3. **收益预测**：模拟迁移 1 层后的新延迟
+4. **滞后检查**：只有当收益超过阈值时才执行迁移，避免振荡
+
+```python
+from intervg_dynamic import solve_ibsa
+
+current_layers = [10, 10, 10]
+execution_times = [100.0, 200.0, 120.0]  # Stage 1 是瓶颈
+
+new_layers, changed, src, dst = solve_ibsa(
+    current_layers,
+    execution_times,
+    threshold_ratio=0.05
+)
+
+if changed:
+    print(f"Moved 1 layer from Stage {src} to Stage {dst}")
+    print(f"New layers: {new_layers}")  # [10, 9, 11]
+```
+
+#### 算法特点
+
+- **Stage 间迁移**：迁移单位是 Transformer Layers
+- **相邻迁移**：只允许相邻 Stage 之间迁移，减少通信开销
+- **滞后机制**：通过 `threshold_ratio` 避免频繁迁移导致的振荡
+- **单位成本估算**：使用 `mu = time / layers` 估算单层处理时间
+
 ## 项目结构
 
 ```
 EdgeVisor/
 ├── distributed_qwen3.py       # 核心分布式模型实现
 ├── init_algorithm.py          # 初始化算法 (RRAGC, CCWF, OLP)
-├── rebalance_algo.py          # 动态负载均衡算法
+├── rebalance_algo.py          # Stage 内动态负载均衡算法
+├── intervg_dynamic.py         # Stage 间动态负载均衡算法 (IBSA)
 ├── test_distributed_qwen3.py  # 测试用例
 ├── infer_config.py            # 模型配置推断工具
 ├── check_bias.py              # 权重偏置检查工具
@@ -194,7 +232,8 @@ EdgeVisor/
 |------|------|
 | `distributed_qwen3.py` | 分布式 Qwen3 模型实现，包含 DistributedConfig、DistributedGroupedQueryAttention、DistributedFeedForward、DistributedTransformerBlock、DistributedQwen3Model 等核心组件 |
 | `init_algorithm.py` | 初始化算法套件：RRAGC（设备分组）、CCWF（Stage内负载分配）、OLP（Stage间层划分） |
-| `rebalance_algo.py` | Stage 内动态负载均衡算法，包含 DeviceStatus 数据结构和 rebalance_intra_stage 函数 |
+| `rebalance_algo.py` | Stage 内动态负载均衡算法，迁移单位为 Attention Heads 和 FFN Dims |
+| `intervg_dynamic.py` | Stage 间动态负载均衡算法 (IBSA)，迁移单位为 Transformer Layers |
 | `test_distributed_qwen3.py` | 端到端测试用例，验证分布式推理正确性和负载均衡算法 |
 | `infer_config.py` | 从模型权重推断模型配置参数 |
 | `check_bias.py` | 检查模型权重中是否存在 bias 参数 |
