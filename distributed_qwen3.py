@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from safetensors.torch import load_file
+from transformers import AutoTokenizer
 from init_algorithm import (
     Device, Link, RRAGCConfig, LayerTask, ModelConfig, 
     run_initialization, InitResult
@@ -79,8 +81,8 @@ class GroupedQueryAttention(nn.Module):
         self.W_value = nn.Linear(cfg.emb_dim, self.num_kv_groups * self.head_dim, bias=True, dtype=cfg.dtype)
         self.out_proj = nn.Linear(self.d_out, cfg.emb_dim, bias=False, dtype=cfg.dtype)
         
-        self.q_norm = RMSNorm(self.head_dim, eps=1e-6)
-        self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
+        self.q_norm = RMSNorm(self.head_dim, eps=1e-6) if cfg.qk_norm else None
+        self.k_norm = RMSNorm(self.head_dim, eps=1e-6) if cfg.qk_norm else None
 
     def forward(self, x, mask, cos, sin, start_pos=0):
         b, num_tokens, _ = x.shape
@@ -92,8 +94,10 @@ class GroupedQueryAttention(nn.Module):
         keys = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
         values = values.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
         
-        queries = self.q_norm(queries)
-        keys = self.k_norm(keys)
+        if self.q_norm:
+            queries = self.q_norm(queries)
+        if self.k_norm:
+            keys = self.k_norm(keys)
         
         queries = apply_rope(queries, cos, sin, offset=start_pos)
         keys = apply_rope(keys, cos, sin, offset=start_pos)
@@ -129,7 +133,7 @@ class TransformerBlock(nn.Module):
 # --- Distributed Logic ---
 
 class DistributedConfig:
-    def __init__(self, vocab_size=151936, emb_dim=4096, n_layers=32, n_heads=32, n_kv_groups=32, head_dim=128, hidden_dim=11008, rope_base=1000000, context_length=32768, dtype=torch.bfloat16):
+    def __init__(self, vocab_size=151936, emb_dim=4096, n_layers=32, n_heads=32, n_kv_groups=32, head_dim=128, hidden_dim=11008, rope_base=1000000, context_length=32768, dtype=torch.bfloat16, qk_norm=False):
         self.vocab_size = vocab_size
         self.emb_dim = emb_dim
         self.n_layers = n_layers
@@ -140,6 +144,7 @@ class DistributedConfig:
         self.rope_base = rope_base
         self.context_length = context_length
         self.dtype = dtype
+        self.qk_norm = qk_norm
 
 class DistributedQwen3Model(nn.Module):
     def __init__(self, config, stage_ranks, layers_per_stage, rank, world_size):
@@ -186,7 +191,64 @@ class DistributedQwen3Model(nn.Module):
             self.final_norm = RMSNorm(config.emb_dim)
             self.out_head = nn.Linear(config.emb_dim, config.vocab_size, bias=False, dtype=config.dtype)
 
-    def forward(self, x):
+    def load_weights(self, model_path):
+        print(f"[Rank {self.rank}] Loading weights from {model_path}...")
+        state_dict = load_file(model_path)
+        
+        # Helper to load a specific layer
+        def load_layer_weights(layer_idx, block):
+            prefix = f"model.layers.{layer_idx}."
+            
+            # Attention
+            block.att.W_query.weight.data.copy_(state_dict[f"{prefix}self_attn.q_proj.weight"])
+            block.att.W_query.bias.data.copy_(state_dict[f"{prefix}self_attn.q_proj.bias"])
+            
+            block.att.W_key.weight.data.copy_(state_dict[f"{prefix}self_attn.k_proj.weight"])
+            block.att.W_key.bias.data.copy_(state_dict[f"{prefix}self_attn.k_proj.bias"])
+            
+            block.att.W_value.weight.data.copy_(state_dict[f"{prefix}self_attn.v_proj.weight"])
+            block.att.W_value.bias.data.copy_(state_dict[f"{prefix}self_attn.v_proj.bias"])
+            
+            block.att.out_proj.weight.data.copy_(state_dict[f"{prefix}self_attn.o_proj.weight"])
+            
+            if block.att.q_norm:
+                block.att.q_norm.scale.data.copy_(state_dict[f"{prefix}self_attn.q_norm.weight"])
+            if block.att.k_norm:
+                block.att.k_norm.scale.data.copy_(state_dict[f"{prefix}self_attn.k_norm.weight"])
+
+            # FeedForward
+            block.ff.fc1.weight.data.copy_(state_dict[f"{prefix}mlp.gate_proj.weight"])
+            block.ff.fc2.weight.data.copy_(state_dict[f"{prefix}mlp.up_proj.weight"])
+            block.ff.fc3.weight.data.copy_(state_dict[f"{prefix}mlp.down_proj.weight"])
+            
+            # Norms
+            block.norm1.scale.data.copy_(state_dict[f"{prefix}input_layernorm.weight"])
+            block.norm2.scale.data.copy_(state_dict[f"{prefix}post_attention_layernorm.weight"])
+
+        # Load Embeddings (Stage 0)
+        if self.my_stage_idx == 0:
+            self.tok_emb.weight.data.copy_(state_dict["model.embed_tokens.weight"])
+            
+        # Load Layers
+        for i, layer in enumerate(self.layers):
+            global_layer_idx = self.start_layer + i
+            load_layer_weights(global_layer_idx, layer)
+            
+        # Load Final Norm & Head (Last Stage)
+        if self.my_stage_idx == len(self.stage_ranks) - 1:
+            self.final_norm.scale.data.copy_(state_dict["model.norm.weight"])
+            
+            if "lm_head.weight" in state_dict:
+                self.out_head.weight.data.copy_(state_dict["lm_head.weight"])
+            elif "model.embed_tokens.weight" in state_dict:
+                print(f"[Rank {self.rank}] lm_head.weight not found, using model.embed_tokens.weight (tied weights)")
+                self.out_head.weight.data.copy_(state_dict["model.embed_tokens.weight"])
+            else:
+                raise KeyError("Neither lm_head.weight nor model.embed_tokens.weight found")
+            
+        print(f"[Rank {self.rank}] Weights loaded successfully.")
+
+    def forward(self, x, start_pos=0):
         # x is input_ids on Stage 0, or hidden_states on other stages
         
         # 1. Receive Input (if not first stage)
@@ -201,15 +263,26 @@ class DistributedQwen3Model(nn.Module):
             x = torch.zeros((b, seq, dim), dtype=self.config.dtype)
             dist.recv(x, src=prev_stage_leader)
             
+            # Receive start_pos
+            start_pos_tensor = torch.zeros(1, dtype=torch.long)
+            dist.recv(start_pos_tensor, src=prev_stage_leader)
+            start_pos = start_pos_tensor.item()
+            
+        # x should be valid now
+        input_dtype = x.dtype
+        
         # 2. Local Processing
         if self.my_stage_idx == 0:
             x = self.tok_emb(x) # Convert ids to embeddings
             
         b, seq, _ = x.shape
         mask = None # Simplified: No mask for now or causal mask
+        if seq > 1:
+             # Create causal mask for prefill
+             mask = torch.triu(torch.ones(seq, seq, dtype=torch.bool), diagonal=1).to(x.device)
         
         for layer in self.layers:
-            x = layer(x, mask, self.cos, self.sin)
+            x = layer(x, mask, self.cos, self.sin, start_pos=start_pos)
             
         # 3. Send Output (if not last stage)
         if self.my_stage_idx < len(self.stage_ranks) - 1:
@@ -221,6 +294,11 @@ class DistributedQwen3Model(nn.Module):
             
             # Send data
             dist.send(x, dst=next_stage_leader)
+            
+            # Send start_pos
+            start_pos_tensor = torch.tensor([start_pos], dtype=torch.long)
+            dist.send(start_pos_tensor, dst=next_stage_leader)
+            
             return None # Return None as work is handed off
             
         # 4. Final Processing (Last Stage)

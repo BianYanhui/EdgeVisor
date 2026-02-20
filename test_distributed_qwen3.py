@@ -1,486 +1,111 @@
+
 import os
 import torch
-import torch.nn as nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import time
-import json
-from distributed_qwen3 import DistributedQwen3Model, DistributedConfig, LocalKVCache, RMSNorm, compute_rope_params, apply_rope
+from transformers import AutoTokenizer
+from distributed_qwen3 import DistributedQwen3Model, DistributedConfig
 
-# --- Reference Model (Single Process) ---
+# Configuration
+MODEL_PATH = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B/model.safetensors"
+TOKENIZER_PATH = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B"
+WORLD_SIZE = 2
+MAX_NEW_TOKENS = 20
 
-class RefFeedForward(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.fc1 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
-        self.fc2 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
-        self.fc3 = nn.Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"], bias=False)
-
-    def forward(self, x):
-        x_fc1 = self.fc1(x)
-        x_fc2 = self.fc2(x)
-        x = nn.functional.silu(x_fc1) * x_fc2
-        return self.fc3(x)
-
-class RefGroupedQueryAttention(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.num_heads = cfg["n_heads"]
-        self.num_kv_groups = cfg["n_kv_groups"]
-        self.head_dim = cfg["head_dim"]
-        self.group_size = self.num_heads // self.num_kv_groups
-        self.d_out = self.num_heads * self.head_dim
-        
-        # Enable bias for Q, K, V, disable for out_proj
-        self.W_query = nn.Linear(cfg["emb_dim"], self.d_out, bias=True, dtype=cfg["dtype"])
-        self.W_key = nn.Linear(cfg["emb_dim"], self.num_kv_groups * self.head_dim, bias=True, dtype=cfg["dtype"])
-        self.W_value = nn.Linear(cfg["emb_dim"], self.num_kv_groups * self.head_dim, bias=True, dtype=cfg["dtype"])
-        self.out_proj = nn.Linear(self.d_out, cfg["emb_dim"], bias=False, dtype=cfg["dtype"])
-        
-        if cfg["qk_norm"]:
-            self.q_norm = RMSNorm(self.head_dim, eps=1e-6)
-            self.k_norm = RMSNorm(self.head_dim, eps=1e-6)
-        else:
-            self.q_norm = self.k_norm = None
-
-    def forward(self, x, mask, cos, sin, start_pos=0):
-        b, num_tokens, _ = x.shape
-        queries = self.W_query(x)
-        keys = self.W_key(x)
-        values = self.W_value(x)
-        
-        queries = queries.view(b, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        keys = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
-        values = values.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)
-        
-        if self.q_norm: queries = self.q_norm(queries)
-        if self.k_norm: keys = self.k_norm(keys)
-        
-        queries = apply_rope(queries, cos, sin, offset=start_pos)
-        keys = apply_rope(keys, cos, sin, offset=start_pos)
-        
-        # Expand K, V
-        keys = keys.repeat_interleave(self.group_size, dim=1)
-        values = values.repeat_interleave(self.group_size, dim=1)
-        
-        attn_scores = queries @ keys.transpose(2, 3)
-        attn_scores = attn_scores.masked_fill(mask, -torch.inf)
-        attn_weights = torch.softmax(attn_scores / self.head_dim**0.5, dim=-1)
-        
-        context = (attn_weights @ values).transpose(1, 2).reshape(b, num_tokens, self.d_out)
-        return self.out_proj(context)
-
-class RefTransformerBlock(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.att = RefGroupedQueryAttention(cfg)
-        self.ff = RefFeedForward(cfg)
-        self.norm1 = RMSNorm(cfg["emb_dim"], eps=1e-6)
-        self.norm2 = RMSNorm(cfg["emb_dim"], eps=1e-6)
-
-    def forward(self, x, mask, cos, sin, start_pos=0):
-        shortcut = x
-        x = self.norm1(x)
-        x = self.att(x, mask, cos, sin, start_pos) + shortcut
-        shortcut = x
-        x = self.norm2(x)
-        x = self.ff(x) + shortcut
-        return x
-
-class ReferenceQwen3Model(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
-        self.trf_blocks = nn.ModuleList([RefTransformerBlock(cfg) for _ in range(cfg["n_layers"])])
-        self.final_norm = RMSNorm(cfg["emb_dim"])
-        self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
-        
-        head_dim = cfg["head_dim"]
-        cos, sin = compute_rope_params(head_dim, theta_base=cfg["rope_base"], context_length=cfg["context_length"])
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
-
-    def forward(self, x):
-        x = self.tok_emb(x)
-        b, seq, _ = x.shape
-        mask = torch.triu(torch.ones(seq, seq, device=x.device), diagonal=1).bool()[None, None, :, :]
-        
-        for block in self.trf_blocks:
-            x = block(x, mask, self.cos, self.sin)
-            
-        x = self.final_norm(x)
-        return self.out_head(x)
-
-    def load_weights_from_hf(self, model_path):
-        from safetensors import safe_open
-        
-        # Load index if exists
-        index_path = os.path.join(model_path, "model.safetensors.index.json")
-        weight_files = []
-        if os.path.exists(index_path):
-            with open(index_path, "r") as f:
-                index = json.load(f)
-            weight_files = sorted(list(set(index["weight_map"].values())))
-        else:
-            if os.path.exists(os.path.join(model_path, "model.safetensors")):
-                weight_files = ["model.safetensors"]
-            else:
-                files = os.listdir(model_path)
-                weight_files = [f for f in files if f.endswith(".safetensors")]
-                
-        print(f"Reference Model Loading weights from {weight_files}")
-        
-        for w_file in weight_files:
-            file_path = os.path.join(model_path, w_file)
-            with safe_open(file_path, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    self._load_single_weight(key, f.get_tensor(key))
-                    
-    def _load_single_weight(self, key, tensor):
-        def assign(param, data, name):
-            if param.shape != data.shape:
-                print(f"Shape Mismatch for {name}: Param {param.shape} vs Data {data.shape}")
-                # Try transpose?
-                if param.shape == data.T.shape:
-                    print("Transposing data...")
-                    data = data.T
-                else:
-                    raise ValueError(f"Shape mismatch for {name}")
-            
-            with torch.no_grad():
-                param.copy_(data)
-
-        if "model.layers" in key:
-            parts = key.split(".")
-            layer_idx = int(parts[2])
-            block = self.trf_blocks[layer_idx]
-            module_name = parts[3]
-            param_type = parts[-1] # "weight" or "bias"
-            
-            if module_name == "self_attn":
-                proj = parts[4]
-                target_module = None
-                if proj == "q_proj": target_module = block.att.W_query
-                elif proj == "k_proj": target_module = block.att.W_key
-                elif proj == "v_proj": target_module = block.att.W_value
-                elif proj == "o_proj": target_module = block.att.out_proj
-                
-                if target_module is not None:
-                    if param_type == "bias" and target_module.bias is not None:
-                        assign(target_module.bias, tensor, key)
-                    elif param_type == "weight":
-                        assign(target_module.weight, tensor, key)
-
-            elif module_name == "mlp":
-                proj = parts[4]
-                target_module = None
-                if proj == "gate_proj": target_module = block.ff.fc1
-                elif proj == "up_proj": target_module = block.ff.fc2
-                elif proj == "down_proj": target_module = block.ff.fc3
-                
-                if target_module is not None:
-                    if param_type == "bias" and target_module.bias is not None:
-                        assign(target_module.bias, tensor, key)
-                    elif param_type == "weight":
-                        assign(target_module.weight, tensor, key)
-
-            elif module_name == "input_layernorm":
-                if param_type == "weight":
-                    assign(block.norm1.scale, tensor, key)
-            elif module_name == "post_attention_layernorm":
-                if param_type == "weight":
-                    assign(block.norm2.scale, tensor, key)
-                    
-        elif "model.embed_tokens" in key:
-            if "weight" in key:
-                assign(self.tok_emb.weight, tensor, key)
-                # Handle tied weights for output head
-                assign(self.out_head.weight, tensor, key)
-        elif "model.norm" in key:
-            if "weight" in key:
-                assign(self.final_norm.scale, tensor, key)
-        elif "lm_head" in key:
-            if "weight" in key:
-                assign(self.out_head.weight, tensor, key)
-
-# --- Test Runner ---
-
-from rebalance_algo import DeviceStatus, rebalance_intra_stage
-
-def run_distributed_process(rank, world_size, cfg, model_path, expected_logits_path, input_ids):
+def run_worker(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
     torch.manual_seed(42)
 
-    # Define Simulated Device Status for Testing Rebalance Algo (Intra-Stage Heads/FFN)
-    # Scenario:
-    # Device 0: Time 100ms. Heads 0-8 (8 heads). FFN 0-5504 (5504 dims).
-    # Device 1: Time 50ms.  Heads 8-16 (8 heads). FFN 5504-11008 (5504 dims).
-    # Imbalance: Dev 0 is 2x slower. Should offload ~25% load to Dev 1.
-    # Move ~2 heads. Move ~1376 FFN dims.
-    # Constraint: Dev 1 holds KV for heads 6-16 (so can accept 6,7).
-    # Dev 1 active start is 8. Can accept 7, 6.
+    # 1. Setup Distributed Config (Manual 2-Stage Pipeline)
+    # Stage 0: Rank 0 (Layers 0-11)
+    # Stage 1: Rank 1 (Layers 12-23)
+    stage_ranks = [[0], [1]]
+    layers_per_stage = [12, 12] # Total 24 layers for Qwen-3-0.6B
     
-    if rank == 0:
-        print("\n--- Testing Rebalance Algorithm (Intra-Stage Heads/FFN) ---")
-        devices = [
-            DeviceStatus(
-                device_id=0,
-                execution_time_ms=100.0,
-                current_head_start=0,
-                current_head_end=8,
-                current_ffn_start=0,
-                current_ffn_end=5504,
-                kv_head_holding_start=0,
-                kv_head_holding_end=8
-            ),
-            DeviceStatus(
-                device_id=1,
-                execution_time_ms=50.0,
-                current_head_start=8,
-                current_head_end=16,
-                current_ffn_start=5504,
-                current_ffn_end=11008,
-                kv_head_holding_start=6, # Can accept down to 6
-                kv_head_holding_end=16
-            )
-        ]
+    # Model Config (Hardcoded for Qwen-3-0.6B / Qwen2-0.5B)
+    # Based on standard Qwen2-0.5B parameters since config.json is missing
+    hf_config = {
+        "vocab_size": 151936,
+        "hidden_size": 896,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 14,
+        "num_key_value_heads": 2,
+        "intermediate_size": 4864,
+        "rope_theta": 1000000.0,
+        "max_position_embeddings": 32768
+    }
         
-        print(f"Initial Devices: {devices}")
-        new_head_counts, new_ffn_counts = rebalance_intra_stage(devices)
-        print(f"Rebalanced Head Counts: {new_head_counts}")
-        print(f"Rebalanced FFN Counts: {new_ffn_counts}")
-        
-    dist.barrier()
+    dist_config = DistributedConfig(
+        vocab_size=hf_config["vocab_size"],
+        emb_dim=hf_config["hidden_size"],
+        n_layers=hf_config["num_hidden_layers"],
+        n_heads=hf_config["num_attention_heads"],
+        n_kv_groups=hf_config["num_key_value_heads"],
+        head_dim=hf_config["hidden_size"] // hf_config["num_attention_heads"],
+        hidden_dim=hf_config["intermediate_size"],
+        rope_base=hf_config["rope_theta"],
+        context_length=hf_config["max_position_embeddings"],
+        dtype=torch.float32, # Use float32 for CPU/Gloo to avoid bfloat16 issues
+        qk_norm=False # Verified via safetensors keys
+    )
 
-    # Config
-    stage_ranks = [[0, 1], [2, 3, 4]]
-    tp_ranks_per_stage = [2, 3]
-    dist_config = DistributedConfig(rank, world_size, stage_ranks, tp_ranks_per_stage)
-    dist_config.setup_groups()
-
-    # Determine Loaded Layers (Overlapping for Dynamic Test)
-    if dist_config.stage_id == 0:
-        managed_layers_range = [0, 12] # Loads 0-11
-    else:
-        managed_layers_range = [10, 24] # Loads 10-23
-
-    # Initialize Distributed Model
-    model = DistributedQwen3Model(cfg, dist_config, managed_layers_range=managed_layers_range)
+    # Initialize Model
+    print(f"[Rank {rank}] Initializing model...")
+    model = DistributedQwen3Model(dist_config, stage_ranks, layers_per_stage, rank, world_size)
     
     # Load Weights
-    model.load_weights_from_hf(model_path)
+    model.load_weights(MODEL_PATH)
     
-    # --- SETUP KV CACHE REDUNDANCY FOR TESTING ---
-    # We expand the maintained KV ranges to allow dynamic rebalancing to actually move heads.
-    # Stage 0 (Ranks 0, 1): 14 heads. Split [0-7], [7-14].
-    # We want to allow Rank 0 to take [0-8] and Rank 1 to take [6-14].
-    if dist_config.stage_id == 0:
-        # Rank 0: Maintain 0-9
-        if dist_config.tp_rank == 0:
-            model.kv_ranges[0] = (0, 9) # Update Root's view
-            for block in model.trf_blocks:
-                block.att.set_maintained_heads(range(0, 9))
-        # Rank 1: Maintain 5-14
-        elif dist_config.tp_rank == 1:
-            for block in model.trf_blocks:
-                block.att.set_maintained_heads(range(5, 14))
-            # Rank 0 (Root) needs to know Rank 1's capability.
-            # But model.kv_ranges is local to each process initially.
-            # Root needs correct info.
-            pass
-            
-    # Sync kv_ranges to Root of each stage
-    if dist_config.tp_size > 1:
-        # Gather local KV ranges? No, manual setup for test.
-        if dist_config.stage_id == 0:
-            if dist_config.tp_rank == 0:
-                model.kv_ranges[1] = (5, 14)
-                
-    local_kv = LocalKVCache(len(model.trf_blocks))
-    
-    model.eval()
-    
-    # Log role
-    print(f"Rank {rank}: Role = Stage {dist_config.stage_id}, TP Rank {dist_config.tp_rank}, Loaded Layers {managed_layers_range}")
-    
-    with torch.no_grad():
-        # Generate tokens
-        generated_ids = []
-        curr_input = input_ids
-        current_pos = 0
+    # 2. Inference Loop
+    if rank == 0:
+        tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH)
+        prompt = "you are a good person with"
+        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(torch.long)
         
-        for step in range(10):
-            if rank == 0:
-                print(f"Step {step}: Running Inference...")
+        print(f"\n[Rank 0] Input: {prompt}")
+        print(f"[Rank 0] Generating...")
+        
+        # --- Inference Loop (Stateless) ---
+        # Since DistributedQwen3Model doesn't have KV Cache, we must pass the full sequence every time.
+        curr_input_ids = input_ids.clone()
+        generated_ids = input_ids[0].tolist()
+        
+        for i in range(MAX_NEW_TOKENS):
+            # Forward pass with full sequence (sends to Rank 1)
+            # start_pos=0 because we are processing the full sequence from scratch
+            model(curr_input_ids, start_pos=0)
             
-            # FORCE REBALANCE at Step 3
-            force = (step == 3)
+            # Receive next token from Rank 1
+            next_token = torch.zeros(1, dtype=torch.long)
+            dist.recv(next_token, src=1)
             
-            logits = model(curr_input, cache=local_kv, start_pos=current_pos, force_rebalance=force)
+            # Update sequence
+            curr_input_ids = torch.cat([curr_input_ids, next_token.unsqueeze(0)], dim=1)
+            generated_ids.append(next_token.item())
             
-            # Check Rebalance Effect (On Root of Stage 0)
-            if step == 3 and dist_config.stage_id == 0 and dist_config.tp_rank == 0:
-                print("\n--- Rebalance Verification Step ---")
-                print(f"Current Step: {step}")
-                print(f"Layer Assignment (Fixed per stage): {model.active_layer_start}-{model.active_layer_end}")
-                
-                print("\n[Before Optimization] Task Allocation:")
-                # We can't easily see 'before' here as it's already updated in forward, 
-                # but we printed it in the model's print statement.
-                # Let's print the CURRENT (Post-Optimization) state which is what matters for the NEXT step.
-                
-                print(f"[Post-Optimization] New Head Allocation: {model.head_counts}")
-                print(f"[Post-Optimization] New FFN Allocation: {model.ffn_counts}")
-                
-                print("\nKV-Cache Maintenance Configuration:")
-                for r in range(dist_config.tp_size):
-                    kv_range = model.kv_ranges[r]
-                    print(f"  Device {r}: Maintains KV Heads {kv_range[0]} to {kv_range[1]}")
-                
-                if model.head_counts != [7, 7]:
-                    print("\nSUCCESS: Dynamic Rebalance Triggered and Changed Head Allocation!")
-                    print("Logic Verified: Slower device (Rank 0) reduced load, Faster device (Rank 1) increased load.")
-                    print("Constraint Verified: Rank 1 took more heads because it maintains KV heads [5, 14).")
-                else:
-                    print("\nFAILURE: Dynamic Rebalance Did Not Change Allocation (or constraints prevented it).")
-                print("-------------------------------\n")
+            print(tokenizer.decode([next_token.item()]), end="", flush=True)
             
-            # Next Token Logic
-            next_token_tensor = torch.zeros(1, 1, dtype=torch.long)
+        print("\n\n[Rank 0] Full Generation:")
+        print(tokenizer.decode(generated_ids))
+        
+    else: # Rank 1
+        # Loop to serve requests
+        # Total steps = 1 (prefill) + (MAX_NEW_TOKENS - 1) = MAX_NEW_TOKENS
+        
+        for i in range(MAX_NEW_TOKENS):
+            # Wait for input from Rank 0 (via model.forward internal recv)
+            # Returns logits because this is the last stage
+            logits = model(None) 
             
-            if dist_config.is_last_stage and dist_config.tp_rank == 0:
-                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-                generated_ids.append(next_token.item())
-                next_token_tensor[0, 0] = next_token
-                
-            # Broadcast next token
-            sender = 2 # Rank 2 is Root of Stage 1 (Last Stage)
-            # Wait, Stage 1 has ranks [2, 3, 4]. Root is 2.
-            dist.broadcast(next_token_tensor, src=sender)
+            # Greedy Sampling
+            next_token = torch.argmax(logits[:, -1, :], dim=-1)
             
-            current_pos += curr_input.shape[1]
-            curr_input = next_token_tensor
-            
-    dist.barrier()
-    
-    # Decode Output
-    if dist_config.is_last_stage and dist_config.tp_rank == 0:
-        print(f"Rank {rank}: Generated IDs: {generated_ids}")
-        try:
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-            full_ids = input_ids[0].tolist() + generated_ids
-            text = tokenizer.decode(full_ids, skip_special_tokens=True)
-            print(f"Rank {rank}: Full Generated Text: '{text}'")
-        except Exception as e:
-            print(f"Rank {rank}: Failed to decode text: {e}")
-            
-    dist.barrier()
+            # Send back to Rank 0
+            dist.send(next_token.cpu(), dst=0)
+
     dist.destroy_process_group()
 
-def main():
-    import sys
-    import subprocess
-
-    def install(package):
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-    try:
-        import numpy
-    except ImportError:
-        print("Installing numpy...")
-        install("numpy")
-    
-    try:
-        import safetensors
-    except ImportError:
-        print("Installing safetensors...")
-        install("safetensors")
-
-    try:
-        import transformers
-    except ImportError:
-        print("Installing transformers...")
-        install("transformers")
-
-    from transformers import AutoTokenizer
-
-    # User provided local path
-    model_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B"
-    
-    # Inferred Config (since config.json is missing or unreliable)
-    # Based on infer_config.py output:
-    # vocab_size: 151936, emb_dim: 896, n_layers: 24, n_heads: 14, n_kv_groups: 2, head_dim: 64, hidden_dim: 4864
-    cfg = {
-        "vocab_size": 151936,
-        "emb_dim": 896,
-        "n_layers": 24,
-        "n_heads": 14,
-        "n_kv_groups": 2, # GQA
-        "head_dim": 64,
-        "hidden_dim": 4864,
-        "dtype": torch.float32, 
-        "rope_base": 1000000.0, # Default for Qwen2.5/3 usually
-        "context_length": 32768,
-        "qk_norm": False # Checked via script, no q_norm keys
-    }
-    
-    print(f"Using Config: {cfg}")
-    
-    # Load Tokenizer
-    print("Loading Tokenizer...")
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        text = "you are a good person with"
-        input_ids = tokenizer(text, return_tensors="pt").input_ids
-        print(f"Input: '{text}' -> IDs: {input_ids}")
-    except Exception as e:
-        print(f"Error loading tokenizer: {e}")
-        # Fallback to dummy if tokenizer fails, but we should try hard
-        input_ids = torch.tensor([[9707, 1879, 374, 264, 1279]], dtype=torch.long)
-        print(f"Using dummy input ids: {input_ids}")
-
-    print("Generating Reference Output (HF AutoModel)...")
-    try:
-        from transformers import AutoModelForCausalLM
-        hf_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.float32, device_map="cpu")
-        with torch.no_grad():
-            hf_output = hf_model(input_ids)
-            expected_logits = hf_output.logits
-        print("HF Reference Logits Generated.")
-        
-        # Verify Manual Ref Model against HF
-        print("Verifying Manual Reference Model against HF...")
-        ref_model = ReferenceQwen3Model(cfg)
-        ref_model.load_weights_from_hf(model_path)
-        with torch.no_grad():
-            manual_logits = ref_model(input_ids)
-            
-        diff = (manual_logits - expected_logits).abs().max()
-        print(f"Manual Ref Model vs HF Model Diff: {diff.item()}")
-        if diff > 1e-3:
-            print("WARNING: Manual Reference Model does NOT match HF Model!")
-        else:
-            print("Manual Reference Model matches HF Model.")
-            
-    except Exception as e:
-        print(f"Failed to load HF Model for verification: {e}")
-        print("Falling back to Manual Reference Model...")
-        ref_model = ReferenceQwen3Model(cfg)
-        ref_model.load_weights_from_hf(model_path)
-        with torch.no_grad():
-            expected_logits = ref_model(input_ids)
-        
-    torch.save(expected_logits, "expected_logits.pt")
-    
-    print("Starting Distributed Test...")
-    world_size = 5
-    # Pass input_ids to distributed process
-    mp.spawn(run_distributed_process, args=(world_size, cfg, model_path, "expected_logits.pt", input_ids), nprocs=world_size, join=True)
-    
-    if os.path.exists("expected_logits.pt"): os.remove("expected_logits.pt")
-
 if __name__ == "__main__":
-    main()
+    mp.spawn(run_worker, args=(WORLD_SIZE,), nprocs=WORLD_SIZE, join=True)
