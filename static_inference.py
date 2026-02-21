@@ -254,6 +254,7 @@ class StaticDistributedQwen3Model(nn.Module):
             
         if self.my_stage_idx == len(self.stage_ranks) - 1:
             self.final_norm.scale.data.copy_(state_dict["model.norm.weight"])
+            # Load full output head weights (no splitting)
             if "lm_head.weight" in state_dict:
                 self.out_head.weight.data.copy_(state_dict["lm_head.weight"])
             else:
@@ -329,7 +330,19 @@ class StaticDistributedQwen3Model(nn.Module):
             return None
         else:
             x = self.final_norm(x)
-            return self.out_head(x)
+            if self.tp_world_size > 1:
+                # If TP > 1, hidden states might be split or need aggregation if coming from a split layer
+                # But here, TransformerBlock output is already aggregated if it was split (e.g. FFN output AllReduce)
+                # However, if we split the Norm or something else, we might need synchronization.
+                # In this implementation, FFN and Attn outputs are AllReduced within the block, 
+                # so x entering final_norm is fully aggregated and identical across TP ranks.
+                pass
+            
+            # Only Rank 0 of the last stage computes logits to save computation
+            if self.tp_rank == 0:
+                return self.out_head(x)
+            else:
+                return None
 
 def parse_allocation_config(config_str: str, ip_list: List[str]) -> dict:
     stages_config = config_str.split('*')
@@ -511,7 +524,13 @@ def main():
         # 2. Sample and Broadcast (Token Generation)
         next_token = torch.zeros(1, 1, dtype=torch.long)
         
+        # Only the designated rank (Last Stage, TP Rank 0) samples
         if my_config['my_rank'] == token_src_rank:
+            if logits is None:
+                # Should not happen for this rank
+                logger.error("Logits is None on token source rank!")
+                break
+                
             # Sample from logits
             # logits: [batch, seq, vocab]
             next_token_val = torch.argmax(logits[:, -1, :], dim=-1) # [batch]
