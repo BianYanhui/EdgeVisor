@@ -6,7 +6,12 @@ import socket
 import time
 import torch
 import torch.nn as nn
-import torch.distributed as dist
+try:
+    import torch.distributed as dist
+    HAS_DISTRIBUTED = hasattr(dist, 'init_process_group')
+except ImportError:
+    import torch.distributed as dist
+    HAS_DISTRIBUTED = False
 import torch.multiprocessing as mp
 from safetensors.torch import load_file
 from transformers import AutoTokenizer
@@ -449,16 +454,24 @@ def main():
     os.environ['MASTER_ADDR'] = my_config['master_addr']
     os.environ['MASTER_PORT'] = str(my_config['master_port'])
     
-    dist.init_process_group(backend="gloo", rank=my_config['my_rank'], world_size=my_config['world_size'])
-    
-    # Create TP groups
-    tp_group = None
-    for ranks in my_config['stage_ranks']:
-        ranks = sorted(ranks)
-        if len(ranks) > 1:
-            g = dist.new_group(ranks)
-            if my_config['my_rank'] in ranks:
-                tp_group = g
+    if HAS_DISTRIBUTED:
+        dist.init_process_group(backend="gloo", rank=my_config['my_rank'], world_size=my_config['world_size'])
+        
+        # Create TP groups
+        tp_group = None
+        for ranks in my_config['stage_ranks']:
+            ranks = sorted(ranks)
+            if len(ranks) > 1:
+                g = dist.new_group(ranks)
+                if my_config['my_rank'] in ranks:
+                    tp_group = g
+    else:
+        if my_config['world_size'] > 1:
+            logger.error("Error: This PyTorch installation does not support distributed execution, but world_size > 1.")
+            logger.error("Please install a PyTorch version with distributed support or run on a single device.")
+            sys.exit(1)
+        logger.warning("Warning: PyTorch distributed support missing. Running in single-device mode.")
+        tp_group = None
     
     dist_config = DistributedConfig() # Use defaults or pass params
     model = StaticDistributedQwen3Model(dist_config, my_config, tp_group=tp_group)
@@ -488,8 +501,7 @@ def main():
         # 1. Run Model Step
         if my_config['my_rank'] == 0:
             # Stage 0: Feed input (prompt or token)
-            _ = model(curr_input_ids, start_pos=start_pos)
-            logits = None
+            logits = model(curr_input_ids, start_pos=start_pos)
         else:
             # Other Stages: Receive input from prev stage
             # If Last Stage: returns logits
@@ -506,7 +518,8 @@ def main():
             next_token[0, 0] = next_token_val.item()
         
         # Broadcast the token to all ranks
-        dist.broadcast(next_token, src=token_src_rank)
+        if HAS_DISTRIBUTED:
+            dist.broadcast(next_token, src=token_src_rank)
         
         # 3. Update State for Next Step
         if my_config['my_rank'] == 0:
@@ -523,7 +536,8 @@ def main():
     if my_config['my_rank'] == 0:
         print("\n")
             
-    dist.destroy_process_group()
+    if HAS_DISTRIBUTED:
+        dist.destroy_process_group()
 
 def _run_test_process(mode, ip, port, config, ips, model_path, tok_path):
     sys.argv = ["static_inference.py", "--mode", mode, "--my_ip", ip, "--port", str(port)]
