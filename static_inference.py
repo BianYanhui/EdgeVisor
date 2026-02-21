@@ -115,6 +115,9 @@ class GroupedQueryAttention(nn.Module):
         
         self.q_norm = RMSNorm(self.head_dim, eps=1e-6) if cfg.qk_norm else None
         self.k_norm = RMSNorm(self.head_dim, eps=1e-6) if cfg.qk_norm else None
+        
+        self.k_cache = None
+        self.v_cache = None
 
     def forward(self, x, mask, cos, sin, start_pos=0):
         b, num_tokens, _ = x.shape
@@ -129,8 +132,39 @@ class GroupedQueryAttention(nn.Module):
         if self.q_norm: queries = self.q_norm(queries)
         if self.k_norm: keys = self.k_norm(keys)
         
+        # Apply RoPE to current keys and queries
         queries = apply_rope(queries, cos, sin, offset=start_pos)
         keys = apply_rope(keys, cos, sin, offset=start_pos)
+        
+        # Update KV Cache
+        if start_pos == 0:
+            # First step: initialize cache
+            self.k_cache = keys
+            self.v_cache = values
+        else:
+            # Subsequent steps: append to cache
+            # Note: We need to handle the case where start_pos resets (new generation)
+            # A simple way is to check if start_pos matches cache length
+            if self.k_cache is not None and start_pos == self.k_cache.shape[2]:
+                self.k_cache = torch.cat([self.k_cache, keys], dim=2)
+                self.v_cache = torch.cat([self.v_cache, values], dim=2)
+            else:
+                # Reset or mismatch, re-initialize (should ideally not happen in correct flow)
+                # But for safety, if start_pos < cache size, we truncate or reset.
+                # Here we assume standard generation flow.
+                if self.k_cache is not None and start_pos < self.k_cache.shape[2]:
+                     self.k_cache = self.k_cache[:, :, :start_pos, :]
+                     self.v_cache = self.v_cache[:, :, :start_pos, :]
+                     self.k_cache = torch.cat([self.k_cache, keys], dim=2)
+                     self.v_cache = torch.cat([self.v_cache, values], dim=2)
+                else:
+                    self.k_cache = keys
+                    self.v_cache = values
+        
+        # Use cached keys/values for attention
+        # keys/values: [b, n_kv_groups, seq_len, head_dim]
+        keys = self.k_cache
+        values = self.v_cache
         
         if self.local_kv_groups > 0:
             local_group_size = self.local_num_heads // self.local_kv_groups
@@ -541,13 +575,23 @@ def main():
             dist.broadcast(next_token, src=token_src_rank)
         
         # 3. Update State for Next Step
+        
+        # Sync step_len (input length) from Rank 0 to all ranks to update start_pos correctly
+        step_len = 0
+        if my_config['my_rank'] == 0:
+            step_len = curr_input_ids.shape[1]
+            
+        if HAS_DISTRIBUTED:
+            sl_tensor = torch.tensor([step_len], dtype=torch.long)
+            dist.broadcast(sl_tensor, src=0)
+            step_len = sl_tensor.item()
+            
+        start_pos += step_len
+
         if my_config['my_rank'] == 0:
             token_id = next_token.item()
             generated_ids.append(token_id)
             print(tokenizer.decode([token_id]), end='', flush=True)
-            
-            # Update position (increment by length of current input)
-            start_pos += curr_input_ids.shape[1]
             
             # Prepare next input
             curr_input_ids = next_token
