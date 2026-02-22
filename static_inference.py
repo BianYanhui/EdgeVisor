@@ -246,10 +246,10 @@ class GroupedQueryAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=1e-6) if cfg.qk_norm else None
         self.k_norm = RMSNorm(self.head_dim, eps=1e-6) if cfg.qk_norm else None
         
-        self.k_cache = None
-        self.v_cache = None
+        self.k_cache = {}
+        self.v_cache = {}
 
-    def forward(self, x, mask, cos, sin, start_pos=0):
+    def forward(self, x, mask, cos, sin, start_pos=0, task_id=0):
         b, num_tokens, _ = x.shape
         queries = self.W_query(x)
         keys = self.W_key(x)
@@ -267,34 +267,44 @@ class GroupedQueryAttention(nn.Module):
         keys = apply_rope(keys, cos, sin, offset=start_pos)
         
         # Update KV Cache
+        if task_id not in self.k_cache:
+            self.k_cache[task_id] = None
+            self.v_cache[task_id] = None
+            
+        k_cache = self.k_cache[task_id]
+        v_cache = self.v_cache[task_id]
+
         if start_pos == 0:
             # First step: initialize cache
-            self.k_cache = keys
-            self.v_cache = values
+            k_cache = keys
+            v_cache = values
         else:
             # Subsequent steps: append to cache
             # Note: We need to handle the case where start_pos resets (new generation)
             # A simple way is to check if start_pos matches cache length
-            if self.k_cache is not None and start_pos == self.k_cache.shape[2]:
-                self.k_cache = torch.cat([self.k_cache, keys], dim=2)
-                self.v_cache = torch.cat([self.v_cache, values], dim=2)
+            if k_cache is not None and start_pos == k_cache.shape[2]:
+                k_cache = torch.cat([k_cache, keys], dim=2)
+                v_cache = torch.cat([v_cache, values], dim=2)
             else:
                 # Reset or mismatch, re-initialize (should ideally not happen in correct flow)
                 # But for safety, if start_pos < cache size, we truncate or reset.
                 # Here we assume standard generation flow.
-                if self.k_cache is not None and start_pos < self.k_cache.shape[2]:
-                     self.k_cache = self.k_cache[:, :, :start_pos, :]
-                     self.v_cache = self.v_cache[:, :, :start_pos, :]
-                     self.k_cache = torch.cat([self.k_cache, keys], dim=2)
-                     self.v_cache = torch.cat([self.v_cache, values], dim=2)
+                if k_cache is not None and start_pos < k_cache.shape[2]:
+                     k_cache = k_cache[:, :, :start_pos, :]
+                     v_cache = v_cache[:, :, :start_pos, :]
+                     k_cache = torch.cat([k_cache, keys], dim=2)
+                     v_cache = torch.cat([v_cache, values], dim=2)
                 else:
-                    self.k_cache = keys
-                    self.v_cache = values
+                    k_cache = keys
+                    v_cache = values
+        
+        self.k_cache[task_id] = k_cache
+        self.v_cache[task_id] = v_cache
         
         # Use cached keys/values for attention
         # keys/values: [b, n_kv_groups, seq_len, head_dim]
-        keys = self.k_cache
-        values = self.v_cache
+        keys = k_cache
+        values = v_cache
         
         # Expand keys/values to match queries using the pre-calculated mapping
         # self.q_head_to_kv_head maps each local query head to the corresponding local KV head index
@@ -330,10 +340,10 @@ class TransformerBlock(nn.Module):
         self.norm1 = RMSNorm(cfg.emb_dim, eps=1e-6)
         self.norm2 = RMSNorm(cfg.emb_dim, eps=1e-6)
 
-    def forward(self, x, mask, cos, sin, start_pos=0):
+    def forward(self, x, mask, cos, sin, start_pos=0, task_id=0):
         shortcut = x
         x = self.norm1(x)
-        x = self.att(x, mask, cos, sin, start_pos) + shortcut
+        x = self.att(x, mask, cos, sin, start_pos, task_id=task_id) + shortcut
         shortcut = x
         x = self.norm2(x)
         x = self.ff(x) + shortcut
@@ -360,39 +370,91 @@ class CommManager:
         self.dtype = dtype
         self.device = device
         # Buffer for Decode Step (batch=1, seq=1): 
-        # Structure: [batch(1), seq(1), hidden_dim, start_pos(1), data(1*1*hidden_dim)]
-        # Total size: 4 + hidden_dim floats
-        self.decode_buffer_size = 4 + hidden_dim
-        self.decode_buffer = torch.zeros(self.decode_buffer_size, dtype=dtype, device=device)
+        # Structure: [batch(1), seq(1), hidden_dim, start_pos(1), task_id(1), data(1*1*hidden_dim)]
+        # Total size: 5 + hidden_dim floats
+        self.decode_buffer_size = 5 + hidden_dim
+        # Map task_id -> buffer
+        self.decode_buffers = {}
+        # Map task_id -> signal buffer
+        self.signal_buffers = {}
+        # Map task_id -> active send request (list or single)
+        self.send_reqs = {}
         
-    def pack_decode(self, x: torch.Tensor, start_pos: int):
-        """Pack (1, 1, hidden_dim) tensor and start_pos into decode_buffer"""
+    def pack_decode(self, x: torch.Tensor, start_pos: int, task_id: int):
+        """Pack (1, 1, hidden_dim) tensor and start_pos into decode_buffer for specific task"""
         # x shape should be (1, 1, hidden_dim)
         if x.shape[0] != 1 or x.shape[1] != 1:
              raise ValueError(f"CommManager.pack_decode only supports shape (1, 1, D), got {x.shape}")
+        
+        # Ensure previous send is complete before overwriting
+        self.ensure_send_complete(task_id)
+
+        # Ensure buffer exists
+        if task_id not in self.decode_buffers:
+            self.decode_buffers[task_id] = torch.zeros(self.decode_buffer_size, dtype=self.dtype, device=self.device)
+            
+        buffer = self.decode_buffers[task_id]
              
         # Use flat view for efficiency
-        # Metadata: 0:batch, 1:seq, 2:dim, 3:start_pos
-        self.decode_buffer[0] = 1.0
-        self.decode_buffer[1] = 1.0
-        self.decode_buffer[2] = float(self.hidden_dim)
-        self.decode_buffer[3] = float(start_pos)
+        # Metadata: 0:batch, 1:seq, 2:dim, 3:start_pos, 4:task_id
+        buffer[0] = 1.0
+        buffer[1] = 1.0
+        buffer[2] = float(self.hidden_dim)
+        buffer[3] = float(start_pos)
+        buffer[4] = float(task_id)
         
-        # Data: 4:end
-        self.decode_buffer[4:].copy_(x.flatten())
-        return self.decode_buffer
+        # Data: 5:end
+        buffer[5:].copy_(x.flatten())
+        return buffer
 
-    def unpack_decode(self):
-        """Unpack decode_buffer into x and start_pos"""
+    def get_signal_buffer(self, task_id):
+        if task_id not in self.signal_buffers:
+            self.signal_buffers[task_id] = torch.zeros(1, dtype=torch.float64, device=self.device)
+        return self.signal_buffers[task_id]
+
+    def register_send_req(self, task_id, req):
+        """Register an active send request (or list of requests) for a task."""
+        # Wait for previous if any (should have been called by ensure, but for safety)
+        self.ensure_send_complete(task_id)
+        self.send_reqs[task_id] = req
+
+    def ensure_send_complete(self, task_id):
+        """Ensure the last send for this task is complete."""
+        if task_id in self.send_reqs and self.send_reqs[task_id] is not None:
+            reqs = self.send_reqs[task_id]
+            if isinstance(reqs, list):
+                for r in reqs: r.wait()
+            else:
+                reqs.wait()
+            self.send_reqs[task_id] = None
+
+    def get_recv_buffer(self, task_id):
+        """Get or create a receive buffer for specific task"""
+        if task_id not in self.decode_buffers:
+            self.decode_buffers[task_id] = torch.zeros(self.decode_buffer_size, dtype=self.dtype, device=self.device)
+        return self.decode_buffers[task_id]
+
+    def unpack_decode(self, task_id):
+        """Unpack decode_buffer for specific task into x and start_pos"""
+        if task_id not in self.decode_buffers:
+             raise ValueError(f"No buffer for task {task_id}")
+             
+        buffer = self.decode_buffers[task_id]
+        
         # Metadata
-        b = int(self.decode_buffer[0].item())
-        s = int(self.decode_buffer[1].item())
-        d = int(self.decode_buffer[2].item())
-        start_pos = int(self.decode_buffer[3].item())
+        b = int(buffer[0].item())
+        s = int(buffer[1].item())
+        d = int(buffer[2].item())
+        start_pos = int(buffer[3].item())
+        tid = int(buffer[4].item())
+        
+        if tid != task_id:
+            # This should not happen if we used the correct buffer for recv
+            pass
         
         # Data
-        x = self.decode_buffer[4:].view(b, s, d).clone()
-        return x, start_pos
+        x = buffer[5:].view(b, s, d).clone()
+        return x, start_pos, tid
 
 class StaticDistributedQwen3Model(nn.Module):
     def __init__(self, config, my_config, tp_group=None):
@@ -526,7 +588,7 @@ class StaticDistributedQwen3Model(nn.Module):
                 self.out_head.weight.data.copy_(state_dict["model.embed_tokens.weight"])
         logger.info(f"[Rank {self.my_rank}] Weights loaded.")
 
-    def forward(self, x, start_pos=0):
+    def forward(self, x, start_pos=0, task_id=0):
         # Stage > 0: Receive from Prev Stage
         if self.my_stage_idx > 0:
             t0 = time.perf_counter()
@@ -601,13 +663,20 @@ class StaticDistributedQwen3Model(nn.Module):
                     self.profiler.record_wait(t1 - t0)
 
                     # 2. Receive Data (Transfer Time)
-                    dist.recv(self.comm_manager.decode_buffer, src=prev_root)
+                    # Use specific buffer for this task
+                    recv_buf = self.comm_manager.get_recv_buffer(task_id)
+                    dist.recv(recv_buf, src=prev_root)
                     
                     # Unpack
-                    x_val, sp_val = self.comm_manager.unpack_decode()
+                    x_val, sp_val, tid_val = self.comm_manager.unpack_decode(task_id)
+                    
+                    if tid_val != task_id:
+                        logger.warning(f"[Rank {self.my_rank}] Task ID mismatch in optimized recv: expected {task_id}, got {tid_val}")
+                    
                     x = x_val
                     # start_pos is updated from message
                     start_pos = sp_val
+                    # task_id = tid_val # Trust local task_id from loop
                     
                     t2 = time.perf_counter()
                     self.profiler.record_comm(t2 - t1)
@@ -633,6 +702,10 @@ class StaticDistributedQwen3Model(nn.Module):
                     dist.recv(sp, src=prev_root)
                     start_pos = sp.item()
                     
+                    tid = torch.zeros(1, dtype=torch.long)
+                    dist.recv(tid, src=prev_root)
+                    task_id = tid.item()
+                    
                     t2 = time.perf_counter()
                     self.profiler.record_comm(t2 - t1)
                 else:
@@ -649,9 +722,11 @@ class StaticDistributedQwen3Model(nn.Module):
                     # Let's keep TP robust for now or apply similar logic.
                     shape = torch.tensor(x.shape, dtype=torch.long)
                     sp = torch.tensor([start_pos], dtype=torch.long)
+                    tid = torch.tensor([task_id], dtype=torch.long)
                 else:
                     shape = torch.zeros(3, dtype=torch.long)
                     sp = torch.zeros(1, dtype=torch.long)
+                    tid = torch.zeros(1, dtype=torch.long)
                 
                 dist.broadcast(shape, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
                 if self.tp_rank != 0:
@@ -659,7 +734,9 @@ class StaticDistributedQwen3Model(nn.Module):
                     x = torch.zeros((b, s, d), dtype=self.config.dtype)
                 dist.broadcast(x, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
                 dist.broadcast(sp, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
+                dist.broadcast(tid, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
                 start_pos = sp.item()
+                task_id = tid.item()
                 self.profiler.record_comm(time.perf_counter() - t0)
 
         # Stage 0: Embeddings
@@ -692,7 +769,7 @@ class StaticDistributedQwen3Model(nn.Module):
         for i, layer in enumerate(self.layers):
             layer_idx = self.start_layer + i
             self.profiler.start_layer(layer_idx)
-            x = layer(x, mask, self.cos, self.sin, start_pos=start_pos)
+            x = layer(x, mask, self.cos, self.sin, start_pos=start_pos, task_id=task_id)
             self.profiler.end_layer()
             
         # Send to Next Stage or Return Logits
@@ -704,16 +781,20 @@ class StaticDistributedQwen3Model(nn.Module):
                 # Check condition for optimized send
                 # Must match receiver's logic: start_pos > 0
                 if start_pos > 0 and x.shape[0] == 1 and x.shape[1] == 1:
-                    # Optimized Send
+                    # Optimized Send (Async to enable pipeline overlap)
                     # 1. Send Signal
-                    signal = torch.tensor([time.perf_counter()], dtype=torch.float64)
-                    dist.send(signal, dst=next_root)
+                    sig_buf = self.comm_manager.get_signal_buffer(task_id)
+                    sig_buf[0] = time.perf_counter()
+                    req_sig = dist.isend(sig_buf, dst=next_root)
                     
                     # 2. Send Data
-                    packed_buf = self.comm_manager.pack_decode(x, start_pos)
-                    dist.send(packed_buf, dst=next_root)
+                    packed_buf = self.comm_manager.pack_decode(x, start_pos, task_id)
+                    req_data = dist.isend(packed_buf, dst=next_root)
+                    
+                    # Register requests to ensure completion before next reuse
+                    self.comm_manager.register_send_req(task_id, [req_sig, req_data])
                 else:
-                    # Robust Send
+                    # Robust Send (Blocking)
                     # 1. Send Signal
                     signal = torch.tensor([time.perf_counter()], dtype=torch.float64)
                     dist.send(signal, dst=next_root)
@@ -722,8 +803,10 @@ class StaticDistributedQwen3Model(nn.Module):
                     dist.send(torch.tensor(x.shape, dtype=torch.long), dst=next_root)
                     dist.send(x, dst=next_root)
                     dist.send(torch.tensor([start_pos], dtype=torch.long), dst=next_root)
-                    
+                    dist.send(torch.tensor([task_id], dtype=torch.long), dst=next_root)
+                
                 self.profiler.record_comm(time.perf_counter() - t0)
+            
             return None
         else:
             t0 = time.perf_counter()
@@ -801,6 +884,28 @@ def start_listener(ip, port):
             if not data: return None
             return json.loads(data.decode('utf-8'))
 
+class TaskState:
+    def __init__(self, task_id, prompt, tokenizer=None, input_ids=None, device='cpu'):
+        self.task_id = task_id
+        self.prompt = prompt
+        if input_ids is not None:
+            self.input_ids = input_ids.to(device)
+        elif tokenizer is not None:
+             self.input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device).to(torch.long)
+        else:
+             self.input_ids = torch.empty(1, 1, dtype=torch.long, device=device) # Dummy for non-rank-0
+             
+        self.curr_input_ids = self.input_ids
+        self.generated_ids = []
+        if self.input_ids.numel() > 0:
+            self.generated_ids = self.input_ids[0].tolist()
+            
+        self.start_pos = 0
+        self.is_complete = False
+        self.start_time = 0.0
+        self.end_time = 0.0
+        self.token_count = 0
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, choices=["listen", "assign"])
@@ -811,10 +916,18 @@ def main():
     parser.add_argument("--model", type=str)
     parser.add_argument("--tokenizer", type=str)
     parser.add_argument("--prompt", type=str)
+    parser.add_argument("--prompts", type=str, help="Pipe-separated prompts")
+    parser.add_argument("--prompts_file", type=str, help="File with prompts")
+    parser.add_argument("--num_tasks", type=int, default=1)
     parser.add_argument("--test_2", action="store_true")
     parser.add_argument("--test_3", action="store_true")
     parser.add_argument("--test_4", action="store_true")
+    parser.add_argument("--test_multitask", action="store_true")
     args = parser.parse_args()
+
+    if args.test_multitask:
+        test_multitask_2_devices()
+        return
 
     if args.test_2:
         test_local_2_devices()
@@ -896,21 +1009,43 @@ def main():
     model = StaticDistributedQwen3Model(dist_config, my_config, tp_group=tp_group)
     model.load_weights(my_config['model_path'])
     
+    # --- Task Initialization ---
+    tasks = []
+    tokenizer = None
+    
     if my_config['my_rank'] == 0:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-        prompt = args.prompt if args.prompt else "Hello"
-        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(torch.long)
         
-        print(f"\n[Rank 0] Input: {prompt}")
-        print(f"[Rank 0] Generating...")
+        prompt_list = []
+        if args.prompts:
+            prompt_list = args.prompts.split('|')
+        elif args.prompts_file:
+            try:
+                with open(args.prompts_file, 'r') as f:
+                    prompt_list = [line.strip() for line in f if line.strip()]
+            except Exception as e:
+                logger.error(f"Failed to read prompts file: {e}")
+                prompt_list = ["Hello"]
+        elif args.prompt:
+            prompt_list = [args.prompt]
+        else:
+            prompt_list = ["Hello"]
+            
+        # Ensure we have enough prompts for num_tasks by cycling
+        if len(prompt_list) < args.num_tasks:
+            import itertools
+            prompt_list = list(itertools.islice(itertools.cycle(prompt_list), args.num_tasks))
+        else:
+            prompt_list = prompt_list[:args.num_tasks]
+            
+        print(f"\n[Rank 0] Initializing {args.num_tasks} tasks with prompts: {prompt_list}")
         
-        curr_input_ids = input_ids
-        generated_ids = input_ids[0].tolist()
-        start_pos = 0
+        for i, p in enumerate(prompt_list):
+            tasks.append(TaskState(i, p, tokenizer=tokenizer))
     else:
-        curr_input_ids = None
-        start_pos = 0
-        generated_ids = []
+        # Other ranks initialize dummy tasks
+        for i in range(args.num_tasks):
+            tasks.append(TaskState(i, "", input_ids=None))
 
     # Identify the rank that will broadcast the sampled token (Root of the last stage)
     last_stage_idx = len(my_config['stage_ranks']) - 1
@@ -920,75 +1055,114 @@ def main():
     
     # --- Performance Metrics Initialization ---
     inference_start_time = time.perf_counter()
-    token_latencies = []
-    generated_tokens_count = 0
     
-    for i in range(20):
-        token_start_time = time.perf_counter()
+    # We generate 20 new tokens per task
+    MAX_NEW_TOKENS = 20
+    
+    # Loop until all tasks are complete
+    step_count = 0
+    while True:
+        # Check completion
+        active_tasks = [t for t in tasks if not t.is_complete]
+        if not active_tasks:
+            break
+            
+        step_count += 1
         
-        # 1. Run Model Step
-        if my_config['my_rank'] == 0:
-            # Stage 0: Feed input (prompt or token)
-            logits = model(curr_input_ids, start_pos=start_pos)
-        else:
-            # Other Stages: Receive input from prev stage
-            # If Last Stage: returns logits
-            # If Middle Stage: returns None
-            logits = model(None, start_pos=start_pos)
+        # 1. Forward Pass (Pipeline Filling)
+        # Iterate over all active tasks to keep pipeline full
+        step_logits = {} # task_id -> logits
+        
+        for task in tasks:
+            if task.is_complete: continue
+            
+            # Start timing for task on first step
+            if my_config['my_rank'] == 0 and task.token_count == 0 and task.start_time == 0.0:
+                task.start_time = time.perf_counter()
 
-        # 2. Sample and Broadcast (Token Generation)
-        next_token = torch.zeros(1, 1, dtype=torch.long)
-        
-        # Only the designated rank (Last Stage, TP Rank 0) samples
-        if my_config['my_rank'] == token_src_rank:
-            if logits is None:
-                # Should not happen for this rank
-                logger.error("Logits is None on token source rank!")
-                break
+            if my_config['my_rank'] == 0:
+                # Stage 0: Feed input
+                logits = model(task.curr_input_ids, start_pos=task.start_pos, task_id=task.task_id)
+            else:
+                # Other Stages: Receive
+                logits = model(None, start_pos=task.start_pos, task_id=task.task_id)
+
+            if my_config['my_rank'] == token_src_rank:
+                step_logits[task.task_id] = logits
+
+        # 2. Sample and Broadcast (Sync Point)
+        # We must broadcast for ALL active tasks to keep ranks in sync
+        for task in tasks:
+            if task.is_complete: continue
+            
+            # Payload: [token, step_len, task_id, is_complete_flag]
+            # Use fixed size tensor for broadcast
+            payload = torch.zeros(4, dtype=torch.long)
+            
+            if my_config['my_rank'] == token_src_rank:
+                if task.task_id not in step_logits:
+                    logger.error(f"Missing logits for task {task.task_id}")
+                    # Should crash or handle
                 
-            # Sample from logits
-            # logits: [batch, seq, vocab]
-            next_token_val = torch.argmax(logits[:, -1, :], dim=-1) # [batch]
-            next_token[0, 0] = next_token_val.item()
-        
-        # Broadcast the token to all ranks
-        if HAS_DISTRIBUTED:
-            dist.broadcast(next_token, src=token_src_rank)
-        
-        # 3. Update State for Next Step
-        
-        # Sync step_len (input length) from Rank 0 to all ranks to update start_pos correctly
-        step_len = 0
-        if my_config['my_rank'] == 0:
-            step_len = curr_input_ids.shape[1]
+                logits = step_logits[task.task_id]
+                # logits: [batch, seq, vocab]
+                next_token_val = torch.argmax(logits[:, -1, :], dim=-1).item()
+                step_len = logits.shape[1]
+                
+                # Determine completion status BEFORE broadcast
+                # Note: We haven't incremented token_count yet, so check +1
+                is_task_complete = 0
+                if task.token_count + 1 >= MAX_NEW_TOKENS:
+                    is_task_complete = 1
+                
+                payload[0] = next_token_val
+                payload[1] = step_len
+                payload[2] = task.task_id
+                payload[3] = is_task_complete
             
-        if HAS_DISTRIBUTED:
-            sl_tensor = torch.tensor([step_len], dtype=torch.long)
-            dist.broadcast(sl_tensor, src=0)
-            step_len = sl_tensor.item()
+            if HAS_DISTRIBUTED:
+                dist.broadcast(payload, src=token_src_rank)
             
-        start_pos += step_len
-
-        if my_config['my_rank'] == 0:
-            token_id = next_token.item()
-            generated_ids.append(token_id)
-            print(tokenizer.decode([token_id]), end='', flush=True)
+            token_val = payload[0].item()
+            step_len_val = payload[1].item()
+            tid_val = payload[2].item()
+            is_complete_val = payload[3].item()
             
-            # Prepare next input
-            curr_input_ids = next_token
-
-        # Record Token Latency (End-to-End for this token)
-        # Note: We record this on all ranks to ensure synchronization, 
-        # but only Rank 0's record is used for final output or we can average.
-        # Actually, only Rank 0 needs to track this for the user output.
-        if my_config['my_rank'] == 0:
-            token_latencies.append(time.perf_counter() - token_start_time)
-            generated_tokens_count += 1
+            # Verify task_id
+            if tid_val != task.task_id:
+                # This could happen if ranks get out of sync on active tasks list
+                # But since logic is deterministic, it should be fine.
+                pass
+                
+            # Update Task State
+            task.start_pos += step_len_val
+            task.token_count += 1
+            
+            if is_complete_val == 1:
+                task.is_complete = True
+            
+            if my_config['my_rank'] == 0:
+                task.generated_ids.append(token_val)
+                task.curr_input_ids = torch.tensor([[token_val]], dtype=torch.long)
+                
+                # Check completion
+                if task.is_complete:
+                    task.end_time = time.perf_counter()
+                    
+                    # Print Task Output immediately
+                    print(f"\n[Rank 0] Task {task.task_id} Completed!")
+                    print(f"Prompt: {task.prompt}")
+                    output_text = tokenizer.decode(task.generated_ids)
+                    print(f"Output: {output_text}")
+                    duration = task.end_time - task.start_time
+                    tps = task.token_count / duration if duration > 0 else 0
+                    print(f"Duration: {duration:.2f}s, TPS: {tps:.2f}")
+                    print("-" * 40)
 
     total_inference_time = time.perf_counter() - inference_start_time
 
     if my_config['my_rank'] == 0:
-        print("\n")
+        print("\nAll tasks completed.")
             
     # model.profiler.print_stats(my_config['my_rank']) # Optional: Keep local stats or remove
 
@@ -1028,24 +1202,13 @@ def main():
             print("Global Inference Statistics (Excludes Model Loading)")
             print("="*60)
             
-            # Token Statistics
-            if token_latencies:
-                ttft = token_latencies[0]
-                avg_latency = sum(token_latencies) / len(token_latencies)
-                throughput = generated_tokens_count / total_inference_time
-                
-                sorted_latencies = sorted(token_latencies)
-                min_lat = sorted_latencies[0]
-                max_lat = sorted_latencies[-1]
-                p50 = sorted_latencies[int(len(sorted_latencies) * 0.5)]
-                p95 = sorted_latencies[int(len(sorted_latencies) * 0.95)]
-                p99 = sorted_latencies[int(len(sorted_latencies) * 0.99)]
-
-                print(f"Tokens Generated: {generated_tokens_count}")
-                print(f"Time To First Token: {ttft:.4f}s")
-                print(f"Latency (s): Avg={avg_latency:.4f}, Min={min_lat:.4f}, Max={max_lat:.4f}, P50={p50:.4f}, P95={p95:.4f}, P99={p99:.4f}")
-                print(f"Throughput: {throughput:.2f} tokens/s")
-                print("-" * 60)
+            # Aggregate Throughput
+            total_tokens = sum(t.token_count for t in tasks)
+            throughput = total_tokens / total_inference_time
+            print(f"Total Tokens Generated: {total_tokens}")
+            print(f"Total Time: {total_inference_time:.4f}s")
+            print(f"System Throughput: {throughput:.2f} tokens/s")
+            print("-" * 60)
             
             # Global Layer Statistics
             # Combine records from all ranks
@@ -1142,21 +1305,45 @@ def main():
     if HAS_DISTRIBUTED:
         dist.destroy_process_group()
 
-def _run_test_process(mode, ip, port, config, ips, model_path, tok_path):
-    sys.argv = ["static_inference.py", "--mode", mode, "--my_ip", ip, "--port", str(port)]
+def _run_test_process(mode, ip, port, config, ips, model_path, tok_path, num_tasks=1, prompts=None):
+    sys.argv = ["static_inference.py", "--mode", mode, "--my_ip", ip, "--port", str(port), "--num_tasks", str(num_tasks)]
     if mode == "assign":
         sys.argv.extend(["--config", config, "--ips", ips, "--model", model_path, "--tokenizer", tok_path])
+        if prompts:
+            sys.argv.extend(["--prompts", prompts])
     main()
+
+def test_multitask_2_devices():
+    # 2 Devices, 3 Tasks
+    model_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B/model.safetensors"
+    tok_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B"
+    # Use different ports (30600, 30601)
+    ips = "127.0.0.1:30600,127.0.0.1:30601"
+    config = "1@12*1@12"
+    num_tasks = 3
+    prompts = "Hello|How are you|What is AI"
+    
+    # Listener: num_tasks=3
+    p1 = mp.Process(target=_run_test_process, args=("listen", "127.0.0.1", 30601, None, None, None, None, num_tasks))
+    # Assigner: num_tasks=3, prompts provided
+    p0 = mp.Process(target=_run_test_process, args=("assign", "127.0.0.1", 30600, config, ips, model_path, tok_path, num_tasks, prompts))
+    
+    p1.start()
+    time.sleep(2)
+    p0.start()
+    p0.join()
+    p1.join()
 
 def test_local_2_devices():
     # 2 Devices: 1@12 * 1@12 (2 stages, no TP)
     model_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B/model.safetensors"
     tok_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B"
-    ips = "127.0.0.1,127.0.0.1:29501"
+    # Use different ports (30500, 30501)
+    ips = "127.0.0.1:30500,127.0.0.1:30501"
     config = "1@12*1@12"
     
-    p1 = mp.Process(target=_run_test_process, args=("listen", "127.0.0.1", 29501, None, None, None, None))
-    p0 = mp.Process(target=_run_test_process, args=("assign", "127.0.0.1", 29500, config, ips, model_path, tok_path))
+    p1 = mp.Process(target=_run_test_process, args=("listen", "127.0.0.1", 30501, None, None, None, None))
+    p0 = mp.Process(target=_run_test_process, args=("assign", "127.0.0.1", 30500, config, ips, model_path, tok_path))
     
     p1.start()
     time.sleep(2)
