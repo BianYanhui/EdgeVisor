@@ -4,6 +4,7 @@ import json
 import argparse
 import socket
 import time
+import pickle
 import torch
 import torch.nn as nn
 try:
@@ -877,7 +878,15 @@ def main():
     token_src_rank = my_config['stage_ranks'][last_stage_idx][0]
 
     model.profiler.reset()
+    
+    # --- Performance Metrics Initialization ---
+    inference_start_time = time.perf_counter()
+    token_latencies = []
+    generated_tokens_count = 0
+    
     for i in range(20):
+        token_start_time = time.perf_counter()
+        
         # 1. Run Model Step
         if my_config['my_rank'] == 0:
             # Stage 0: Feed input (prompt or token)
@@ -929,10 +938,158 @@ def main():
             # Prepare next input
             curr_input_ids = next_token
 
+        # Record Token Latency (End-to-End for this token)
+        # Note: We record this on all ranks to ensure synchronization, 
+        # but only Rank 0's record is used for final output or we can average.
+        # Actually, only Rank 0 needs to track this for the user output.
+        if my_config['my_rank'] == 0:
+            token_latencies.append(time.perf_counter() - token_start_time)
+            generated_tokens_count += 1
+
+    total_inference_time = time.perf_counter() - inference_start_time
+
     if my_config['my_rank'] == 0:
         print("\n")
             
-    model.profiler.print_stats(my_config['my_rank'])
+    # model.profiler.print_stats(my_config['my_rank']) # Optional: Keep local stats or remove
+
+    # --- Global Statistics Collection ---
+    if HAS_DISTRIBUTED:
+        # 1. Prepare Local Summary
+        my_summary = {
+            'rank': my_config['my_rank'],
+            'stage_idx': my_config['my_stage_idx'],
+            'layers_per_stage': my_config['layers_per_stage'], # List of layer counts per stage
+            'records': model.profiler.records,
+            'total_compute': model.profiler.total_compute,
+            'total_comm': model.profiler.total_comm,
+        }
+        
+        # 2. Gather Summaries at Rank 0
+        if my_config['my_rank'] == 0:
+            all_summaries = [my_summary]
+            # Receive from all other ranks
+            for src in range(1, my_config['world_size']):
+                # Receive size first
+                size_tensor = torch.zeros(1, dtype=torch.long)
+                dist.recv(size_tensor, src=src)
+                data_size = size_tensor.item()
+                
+                # Receive data
+                data_tensor = torch.zeros(data_size, dtype=torch.uint8)
+                dist.recv(data_tensor, src=src)
+                
+                # Deserialize
+                other_summary = pickle.loads(bytes(data_tensor.tolist()))
+                all_summaries.append(other_summary)
+            
+            # 3. Process and Print Global Statistics
+            print("="*60)
+            print("Global Inference Statistics (Excludes Model Loading)")
+            print("="*60)
+            
+            # Token Statistics
+            if token_latencies:
+                ttft = token_latencies[0]
+                avg_latency = sum(token_latencies) / len(token_latencies)
+                throughput = generated_tokens_count / total_inference_time
+                
+                sorted_latencies = sorted(token_latencies)
+                min_lat = sorted_latencies[0]
+                max_lat = sorted_latencies[-1]
+                p50 = sorted_latencies[int(len(sorted_latencies) * 0.5)]
+                p95 = sorted_latencies[int(len(sorted_latencies) * 0.95)]
+                p99 = sorted_latencies[int(len(sorted_latencies) * 0.99)]
+
+                print(f"Tokens Generated: {generated_tokens_count}")
+                print(f"Time To First Token: {ttft:.4f}s")
+                print(f"Latency (s): Avg={avg_latency:.4f}, Min={min_lat:.4f}, Max={max_lat:.4f}, P50={p50:.4f}, P95={p95:.4f}, P99={p99:.4f}")
+                print(f"Throughput: {throughput:.2f} tokens/s")
+                print("-" * 60)
+            
+            # Global Layer Statistics
+            # Combine records from all ranks
+            global_layer_records = {}
+            for summary in all_summaries:
+                for layer_idx, record in summary['records'].items():
+                    # If TP is used, multiple ranks might have the same layer.
+                    # We should take the MAX compute and MAX comm? Or Average?
+                    # For TP, compute is parallel, so max is the bottleneck.
+                    # Comm is also parallel.
+                    # However, simply taking the record from the first rank that has it is usually enough for homogeneous TP.
+                    # Or better: average them if multiple ranks have the same layer.
+                    if layer_idx not in global_layer_records:
+                        global_layer_records[layer_idx] = {'compute': [], 'comm': []}
+                    global_layer_records[layer_idx]['compute'].append(record['compute'])
+                    global_layer_records[layer_idx]['comm'].append(record['comm'])
+            
+            print("Global Layer Statistics (Avg across TP ranks if applicable):")
+            print(f"{'Layer':<10} | {'Compute (s)':<15} | {'Comm (s)':<15} | {'Total (s)':<15}")
+            print("-" * 60)
+            
+            sorted_layers = sorted(global_layer_records.keys())
+            for idx in sorted_layers:
+                comps = global_layer_records[idx]['compute']
+                comms = global_layer_records[idx]['comm']
+                avg_comp = sum(comps) / len(comps)
+                avg_comm = sum(comms) / len(comms)
+                total = avg_comp + avg_comm
+                print(f"{idx:<10} | {avg_comp:<15.6f} | {avg_comm:<15.6f} | {total:<15.6f}")
+            print("-" * 60)
+
+            # Stage Statistics
+            print("[Per-Stage Summary]")
+            print(f"{'Stage':<6} | {'Layers':<8} | {'Compute (s)':<12} | {'Comm (s)':<12} | {'Total (s)':<12}")
+            print("-" * 60)
+            
+            # Group summaries by stage
+            stage_stats = {}
+            for summary in all_summaries:
+                s_idx = summary['stage_idx']
+                if s_idx not in stage_stats:
+                    stage_stats[s_idx] = {'compute': [], 'comm': [], 'layers': 0}
+                
+                stage_stats[s_idx]['compute'].append(summary['total_compute'])
+                stage_stats[s_idx]['comm'].append(summary['total_comm'])
+                stage_stats[s_idx]['layers'] = summary['layers_per_stage'][s_idx]
+
+            sorted_stages = sorted(stage_stats.keys())
+            
+            # Calculate totals for bottleneck identification
+            stage_totals = []
+            for s_idx in sorted_stages:
+                comps = stage_stats[s_idx]['compute']
+                comms = stage_stats[s_idx]['comm']
+                avg_comp = sum(comps) / len(comps)
+                avg_comm = sum(comms) / len(comms)
+                stage_totals.append((s_idx, avg_comp + avg_comm))
+            
+            # Find max total time
+            max_total = max(t[1] for t in stage_totals) if stage_totals else 0
+            
+            for s_idx in sorted_stages:
+                # Average across TP ranks in the same stage
+                comps = stage_stats[s_idx]['compute']
+                comms = stage_stats[s_idx]['comm']
+                avg_comp = sum(comps) / len(comps)
+                avg_comm = sum(comms) / len(comms)
+                total = avg_comp + avg_comm
+                layers_count = stage_stats[s_idx]['layers']
+                
+                bottleneck_mark = "(*)" if abs(total - max_total) < 1e-6 else ""
+                
+                print(f"{s_idx:<6} | {layers_count:<8} | {avg_comp:<12.4f} | {avg_comm:<12.4f} | {total:<12.4f} {bottleneck_mark}")
+            print("=" * 60)
+            print("(*) Indicates Bottleneck Stage")
+
+        else:
+            # Send Summary to Rank 0
+            data_bytes = pickle.dumps(my_summary)
+            data_tensor = torch.tensor(list(data_bytes), dtype=torch.uint8)
+            size_tensor = torch.tensor([len(data_bytes)], dtype=torch.long)
+            
+            dist.send(size_tensor, dst=0)
+            dist.send(data_tensor, dst=0)
 
     if HAS_DISTRIBUTED:
         dist.destroy_process_group()
