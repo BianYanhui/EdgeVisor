@@ -67,7 +67,7 @@ def apply_rope(x, cos, sin, offset=0):
     return x_rotated.to(dtype=x.dtype)
 
 class FeedForward(nn.Module):
-    def __init__(self, cfg, tp_rank, tp_world_size, tp_group=None):
+    def __init__(self, cfg, tp_rank, tp_world_size, tp_group=None, tp_ratios=None):
         super().__init__()
         self.tp_rank = tp_rank
         self.tp_world_size = tp_world_size
@@ -75,7 +75,20 @@ class FeedForward(nn.Module):
         self.hidden_dim = cfg.hidden_dim
         self.emb_dim = cfg.emb_dim
         
-        self.local_hidden_dim = self.hidden_dim // tp_world_size
+        # Non-uniform splitting logic
+        if tp_ratios is None:
+            tp_ratios = [1] * tp_world_size
+        
+        total_ratio = sum(tp_ratios)
+        # Calculate start and end indices based on cumulative ratios to ensure full coverage
+        # even if division is not exact (approximate handling for FFN)
+        start_ratio = sum(tp_ratios[:tp_rank])
+        end_ratio = sum(tp_ratios[:tp_rank + 1])
+        
+        start_idx = int(round(start_ratio * self.hidden_dim / total_ratio))
+        end_idx = int(round(end_ratio * self.hidden_dim / total_ratio))
+        
+        self.local_hidden_dim = end_idx - start_idx
         
         self.fc1 = nn.Linear(cfg.emb_dim, self.local_hidden_dim, dtype=cfg.dtype, bias=False)
         self.fc2 = nn.Linear(cfg.emb_dim, self.local_hidden_dim, dtype=cfg.dtype, bias=False)
@@ -93,7 +106,7 @@ class FeedForward(nn.Module):
         return x_out
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, cfg, tp_rank, tp_world_size, tp_group=None):
+    def __init__(self, cfg, tp_rank, tp_world_size, tp_group=None, tp_ratios=None):
         super().__init__()
         self.tp_rank = tp_rank
         self.tp_world_size = tp_world_size
@@ -102,8 +115,40 @@ class GroupedQueryAttention(nn.Module):
         self.num_kv_groups = cfg.n_kv_groups
         self.head_dim = cfg.head_dim
         
-        self.local_num_heads = self.num_heads // tp_world_size
-        self.local_kv_groups = self.num_kv_groups // tp_world_size
+        # Non-uniform splitting logic
+        if tp_ratios is None:
+            tp_ratios = [1] * tp_world_size
+            
+        total_ratio = sum(tp_ratios)
+        start_ratio = sum(tp_ratios[:tp_rank])
+        end_ratio = sum(tp_ratios[:tp_rank + 1])
+        
+        # Calculate local heads
+        start_head_idx = int(round(start_ratio * self.num_heads / total_ratio))
+        end_head_idx = int(round(end_ratio * self.num_heads / total_ratio))
+        self.local_num_heads = end_head_idx - start_head_idx
+        
+        # Calculate needed KV heads logic
+        # Each query head h maps to kv head h // group_size
+        group_size = self.num_heads // self.num_kv_groups
+        needed_kv_indices = set()
+        self.q_head_to_kv_head = [] # Map local q index to local kv index
+        
+        # Find all unique needed KV indices
+        for h in range(start_head_idx, end_head_idx):
+            kv_idx = h // group_size
+            needed_kv_indices.add(kv_idx)
+            
+        self.kv_head_indices = sorted(list(needed_kv_indices))
+        self.local_kv_groups = len(self.kv_head_indices)
+        
+        # Create map from local Q index to local KV index
+        global_kv_to_local = {k: i for i, k in enumerate(self.kv_head_indices)}
+        for h in range(start_head_idx, end_head_idx):
+            global_kv = h // group_size
+            self.q_head_to_kv_head.append(global_kv_to_local[global_kv])
+            
+        self.q_head_to_kv_head = torch.tensor(self.q_head_to_kv_head, dtype=torch.long)
         
         self.d_out = self.local_num_heads * self.head_dim
         self.d_kv = self.local_kv_groups * self.head_dim
@@ -166,10 +211,12 @@ class GroupedQueryAttention(nn.Module):
         keys = self.k_cache
         values = self.v_cache
         
-        if self.local_kv_groups > 0:
-            local_group_size = self.local_num_heads // self.local_kv_groups
-            keys = keys.repeat_interleave(local_group_size, dim=1)
-            values = values.repeat_interleave(local_group_size, dim=1)
+        # Expand keys/values to match queries using the pre-calculated mapping
+        # self.q_head_to_kv_head maps each local query head to the corresponding local KV head index
+        if self.local_num_heads > 0:
+            indices = self.q_head_to_kv_head.to(keys.device)
+            keys = keys.index_select(1, indices)
+            values = values.index_select(1, indices)
         
         attn_scores = queries @ keys.transpose(2, 3)
         if mask is not None:
@@ -185,10 +232,10 @@ class GroupedQueryAttention(nn.Module):
         return out
 
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg, tp_rank, tp_world_size, tp_group=None):
+    def __init__(self, cfg, tp_rank, tp_world_size, tp_group=None, tp_ratios=None):
         super().__init__()
-        self.att = GroupedQueryAttention(cfg, tp_rank, tp_world_size, tp_group)
-        self.ff = FeedForward(cfg, tp_rank, tp_world_size, tp_group)
+        self.att = GroupedQueryAttention(cfg, tp_rank, tp_world_size, tp_group, tp_ratios)
+        self.ff = FeedForward(cfg, tp_rank, tp_world_size, tp_group, tp_ratios)
         self.norm1 = RMSNorm(cfg.emb_dim, eps=1e-6)
         self.norm2 = RMSNorm(cfg.emb_dim, eps=1e-6)
 
@@ -230,13 +277,15 @@ class StaticDistributedQwen3Model(nn.Module):
         self.tp_world_size = len(self.tp_group_ranks)
         self.tp_rank = self.tp_group_ranks.index(self.my_rank)
         
+        self.tp_ratios = my_config.get('tp_ratios', [1] * self.tp_world_size)
+        
         self.start_layer = sum(self.layers_per_stage[:self.my_stage_idx])
         self.num_layers = self.layers_per_stage[self.my_stage_idx]
         
-        logger.info(f"[Rank {self.my_rank}] Stage {self.my_stage_idx}, TP {self.tp_rank}/{self.tp_world_size}, Layers {self.start_layer}-{self.start_layer+self.num_layers-1}")
+        logger.info(f"[Rank {self.my_rank}] Stage {self.my_stage_idx}, TP {self.tp_rank}/{self.tp_world_size}, Layers {self.start_layer}-{self.start_layer+self.num_layers-1}, Ratios: {self.tp_ratios}")
         
         self.layers = nn.ModuleList([
-            TransformerBlock(config, self.tp_rank, self.tp_world_size, self.tp_group) 
+            TransformerBlock(config, self.tp_rank, self.tp_world_size, self.tp_group, self.tp_ratios) 
             for _ in range(self.num_layers)
         ])
         
@@ -260,18 +309,64 @@ class StaticDistributedQwen3Model(nn.Module):
             
             def load_split(target, key, dim):
                 w = state_dict[key]
-                chunk = w.shape[dim] // self.tp_world_size
-                start = self.tp_rank * chunk
-                if dim == 0: target.data.copy_(w[start:start+chunk])
-                else: target.data.copy_(w[:, start:start+chunk])
+                total_ratio = sum(self.tp_ratios)
+                dim_size = w.shape[dim]
+                size_per_ratio = dim_size / total_ratio
+                
+                # Calculate current rank split position
+                start = int(round(sum(self.tp_ratios[:self.tp_rank]) * size_per_ratio))
+                end = int(round(sum(self.tp_ratios[:self.tp_rank + 1]) * size_per_ratio))
+                
+                if dim == 0: target.data.copy_(w[start:end])
+                else: target.data.copy_(w[:, start:end])
 
-            load_split(block.att.W_query.weight, f"{prefix}self_attn.q_proj.weight", 0)
-            load_split(block.att.W_query.bias, f"{prefix}self_attn.q_proj.bias", 0)
-            load_split(block.att.W_key.weight, f"{prefix}self_attn.k_proj.weight", 0)
-            load_split(block.att.W_key.bias, f"{prefix}self_attn.k_proj.bias", 0)
-            load_split(block.att.W_value.weight, f"{prefix}self_attn.v_proj.weight", 0)
-            load_split(block.att.W_value.bias, f"{prefix}self_attn.v_proj.bias", 0)
-            load_split(block.att.out_proj.weight, f"{prefix}self_attn.o_proj.weight", 1)
+            def load_split_heads(target, key, dim, num_groups, head_dim, indices=None):
+                w = state_dict[key]
+                total_ratio = sum(self.tp_ratios)
+                
+                if indices is None:
+                    # Calculate start/end based on GROUPS to match __init__ logic
+                    start_ratio = sum(self.tp_ratios[:self.tp_rank])
+                    end_ratio = sum(self.tp_ratios[:self.tp_rank + 1])
+                    
+                    start_group = int(round(start_ratio * num_groups / total_ratio))
+                    end_group = int(round(end_ratio * num_groups / total_ratio))
+                    
+                    start_idx = start_group * head_dim
+                    end_idx = end_group * head_dim
+                    
+                    # If target is empty (local_groups=0), skip copy
+                    if start_idx == end_idx:
+                        return
+
+                    if dim == 0: target.data.copy_(w[start_idx:end_idx])
+                    else: target.data.copy_(w[:, start_idx:end_idx])
+                else:
+                    # Load specific indices
+                    if len(indices) == 0:
+                        return
+                        
+                    slices = []
+                    for idx in indices:
+                        start = idx * head_dim
+                        end = (idx + 1) * head_dim
+                        if dim == 0:
+                            slices.append(w[start:end])
+                        else:
+                            slices.append(w[:, start:end])
+                    
+                    if dim == 0:
+                        target.data.copy_(torch.cat(slices, dim=0))
+                    else:
+                        target.data.copy_(torch.cat(slices, dim=1))
+
+            load_split_heads(block.att.W_query.weight, f"{prefix}self_attn.q_proj.weight", 0, self.config.n_heads, self.config.head_dim)
+            load_split_heads(block.att.W_query.bias, f"{prefix}self_attn.q_proj.bias", 0, self.config.n_heads, self.config.head_dim)
+            load_split_heads(block.att.W_key.weight, f"{prefix}self_attn.k_proj.weight", 0, self.config.n_kv_groups, self.config.head_dim, indices=block.att.kv_head_indices)
+            load_split_heads(block.att.W_key.bias, f"{prefix}self_attn.k_proj.bias", 0, self.config.n_kv_groups, self.config.head_dim, indices=block.att.kv_head_indices)
+            load_split_heads(block.att.W_value.weight, f"{prefix}self_attn.v_proj.weight", 0, self.config.n_kv_groups, self.config.head_dim, indices=block.att.kv_head_indices)
+            load_split_heads(block.att.W_value.bias, f"{prefix}self_attn.v_proj.bias", 0, self.config.n_kv_groups, self.config.head_dim, indices=block.att.kv_head_indices)
+            load_split_heads(block.att.out_proj.weight, f"{prefix}self_attn.o_proj.weight", 1, self.config.n_heads, self.config.head_dim)
             
             load_split(block.ff.fc1.weight, f"{prefix}mlp.gate_proj.weight", 0)
             load_split(block.ff.fc2.weight, f"{prefix}mlp.up_proj.weight", 0)
@@ -444,6 +539,7 @@ def main():
     parser.add_argument("--tokenizer", type=str)
     parser.add_argument("--prompt", type=str)
     parser.add_argument("--test_2", action="store_true")
+    parser.add_argument("--test_3", action="store_true")
     parser.add_argument("--test_4", action="store_true")
     args = parser.parse_args()
 
@@ -452,6 +548,9 @@ def main():
         return
     if args.test_4:
         test_local_4_devices()
+        return
+    if args.test_3:
+        test_local_3_devices()
         return
 
     if not args.mode:
@@ -642,6 +741,29 @@ def test_local_4_devices():
     time.sleep(2)
     # Assign (Port 29600)
     p0 = mp.Process(target=_run_test_process, args=("assign", "127.0.0.1", 29600, config, ips, model_path, tok_path))
+    p0.start()
+    procs.append(p0)
+    
+    for p in procs:
+        p.join()
+
+def test_local_3_devices():
+    # 3 Devices: 5:1:1@24 (1 stage, non-uniform TP)
+    model_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B/model.safetensors"
+    tok_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B"
+    ips = "127.0.0.1:29800,127.0.0.1:29801,127.0.0.1:29802"
+    config = "5:1:1@24"
+    
+    procs = []
+    # Listeners (Ports 29801, 29802)
+    for port in [29801, 29802]:
+        p = mp.Process(target=_run_test_process, args=("listen", "127.0.0.1", port, None, None, None, None))
+        p.start()
+        procs.append(p)
+        
+    time.sleep(2)
+    # Assign (Port 29800)
+    p0 = mp.Process(target=_run_test_process, args=("assign", "127.0.0.1", 29800, config, ips, model_path, tok_path))
     p0.start()
     procs.append(p0)
     
