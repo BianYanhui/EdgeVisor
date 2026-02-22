@@ -169,7 +169,10 @@ class FeedForward(nn.Module):
         
         if self.tp_world_size > 1:
             t0 = time.perf_counter()
-            dist.all_reduce(x_out, op=dist.ReduceOp.SUM, group=self.tp_group)
+            # Async AllReduce
+            handle = dist.all_reduce(x_out, op=dist.ReduceOp.SUM, group=self.tp_group, async_op=True)
+            # Wait for completion
+            handle.wait()
             if self.profiler:
                 self.profiler.record_comm(time.perf_counter() - t0)
             
@@ -299,7 +302,10 @@ class GroupedQueryAttention(nn.Module):
         
         if self.tp_world_size > 1:
             t0 = time.perf_counter()
-            dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.tp_group)
+            # Async AllReduce
+            handle = dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.tp_group, async_op=True)
+            # Wait for completion
+            handle.wait()
             if self.profiler:
                 self.profiler.record_comm(time.perf_counter() - t0)
             
@@ -336,6 +342,47 @@ class DistributedConfig:
         self.dtype = dtype
         self.qk_norm = qk_norm
 
+class CommManager:
+    """Helper class for managing communication buffers and optimized operations"""
+    def __init__(self, hidden_dim, dtype=torch.float32, device='cpu'):
+        self.hidden_dim = hidden_dim
+        self.dtype = dtype
+        self.device = device
+        # Buffer for Decode Step (batch=1, seq=1): 
+        # Structure: [batch(1), seq(1), hidden_dim, start_pos(1), data(1*1*hidden_dim)]
+        # Total size: 4 + hidden_dim floats
+        self.decode_buffer_size = 4 + hidden_dim
+        self.decode_buffer = torch.zeros(self.decode_buffer_size, dtype=dtype, device=device)
+        
+    def pack_decode(self, x: torch.Tensor, start_pos: int):
+        """Pack (1, 1, hidden_dim) tensor and start_pos into decode_buffer"""
+        # x shape should be (1, 1, hidden_dim)
+        if x.shape[0] != 1 or x.shape[1] != 1:
+             raise ValueError(f"CommManager.pack_decode only supports shape (1, 1, D), got {x.shape}")
+             
+        # Use flat view for efficiency
+        # Metadata: 0:batch, 1:seq, 2:dim, 3:start_pos
+        self.decode_buffer[0] = 1.0
+        self.decode_buffer[1] = 1.0
+        self.decode_buffer[2] = float(self.hidden_dim)
+        self.decode_buffer[3] = float(start_pos)
+        
+        # Data: 4:end
+        self.decode_buffer[4:].copy_(x.flatten())
+        return self.decode_buffer
+
+    def unpack_decode(self):
+        """Unpack decode_buffer into x and start_pos"""
+        # Metadata
+        b = int(self.decode_buffer[0].item())
+        s = int(self.decode_buffer[1].item())
+        d = int(self.decode_buffer[2].item())
+        start_pos = int(self.decode_buffer[3].item())
+        
+        # Data
+        x = self.decode_buffer[4:].view(b, s, d).clone()
+        return x, start_pos
+
 class StaticDistributedQwen3Model(nn.Module):
     def __init__(self, config, my_config, tp_group=None):
         super().__init__()
@@ -344,6 +391,9 @@ class StaticDistributedQwen3Model(nn.Module):
         self.profiler = InferenceProfiler()
         self.my_rank = my_config['my_rank']
         self.world_size = my_config['world_size']
+        
+        # Initialize Communication Manager
+        self.comm_manager = CommManager(config.emb_dim, dtype=config.dtype)
         self.my_stage_idx = my_config['my_stage_idx']
         self.stage_ranks = my_config['stage_ranks']
         self.layers_per_stage = my_config['layers_per_stage']
@@ -471,23 +521,102 @@ class StaticDistributedQwen3Model(nn.Module):
             t0 = time.perf_counter()
             prev_root = self.stage_ranks[self.my_stage_idx - 1][0]
             if self.tp_rank == 0:
-                shape = torch.zeros(3, dtype=torch.long)
-                dist.recv(shape, src=prev_root)
-                b, s, d = shape.tolist()
-                x = torch.zeros((b, s, d), dtype=self.config.dtype)
-                dist.recv(x, src=prev_root)
-                sp = torch.zeros(1, dtype=torch.long)
-                dist.recv(sp, src=prev_root)
-                start_pos = sp.item()
+                # Optimized for decode step (seq_len=1)
+                # We assume decode if shape is (1, 1, hidden) but here we don't know shape yet.
+                # To support optimization, we can first receive a small "flag" or assume decode.
+                # However, for simplicity and robustness, we can try to receive the fixed-size decode buffer first?
+                # No, standard send/recv must match size.
+                # Since this is "Static" inference, we can assume:
+                # If we are in "decode mode" (which caller knows?), we use optimized path.
+                # But here `forward` doesn't know if it's decode or prefill easily without extra args.
+                # Heuristic: We can check `x` shape if we are sender. But we are receiver here.
+                # Let's rely on the fact that for LLM inference, prefill is rare (once) and decode is frequent.
+                # We can add a `is_prefill` flag to forward? Or just check start_pos?
+                # start_pos=0 usually implies prefill, but not always (could be single token input).
+                
+                # BETTER APPROACH:
+                # The sender (Stage i-1) decides.
+                # But receiver needs to know what to receive.
+                # Let's add `use_optimized_comm` argument to forward, defaulting to True for single token?
+                # Or just assume `x.shape[1] == 1` implies optimized path?
+                # Receiver doesn't know x.shape[1].
+                
+                # Protocol Change:
+                # Always receive a fixed header? No, latency.
+                # Solution: The caller (inference loop) knows.
+                # We can add `is_decode` arg to forward.
+                pass
+
+            # Since I cannot change the signature of forward() easily without updating all calls (which is fine),
+            # I will use `x` (input) to determine mode? 
+            # Wait, Stage > 0 `x` is None or dummy at start.
+            
+            # Let's assume:
+            # If `start_pos > 0`, it is likely decode.
+            # If `start_pos == 0`, it is prefill.
+            # But what if we resume?
+            # Let's just use the `x` argument passed to `forward`.
+            # In `static_inference.py` main loop:
+            # Stage 0 calls `model(input_ids, start_pos)`.
+            # Other Stages call `model(None, start_pos=0)`?
+            # Actually, `start_pos` is passed to all stages in the loop?
+            # In the main loop:
+            # `logits = model(input_ids, start_pos=start_pos)`
+            # All ranks call this. `start_pos` is synced (incremented locally).
+            # So all ranks know `start_pos`.
+            # If `start_pos > 0`, we can assume decode (seq_len=1).
+            # If `start_pos == 0`, it is prefill (seq_len >= 1).
+            
+            # Wait, `start_pos` starts at 0.
+            # Prefill: `start_pos=0`, `seq_len` = input length.
+            # Decode step 1: `start_pos=input_length`, `seq_len=1`.
+            # So if `start_pos > 0`, it is definitely decode (seq_len=1) in standard autoregressive.
+            # What if input_length=1? Then start_pos=0 and seq_len=1.
+            # In this case, we use the "prefill" path (3-step) which is fine for the very first token.
+            # Subsequent tokens will have start_pos > 0.
+            
+            # Logic:
+            # if start_pos > 0: use optimized decode comm (1 call).
+            # else: use robust comm (3 calls).
+            
+            if start_pos > 0:
+                # Optimized Path (Decode)
+                if self.tp_rank == 0:
+                    dist.recv(self.comm_manager.decode_buffer, src=prev_root)
+                    # Unpack
+                    # We trust the sender sent the packed buffer.
+                    # Note: x is created here.
+                    x_val, sp_val = self.comm_manager.unpack_decode()
+                    x = x_val
+                    # start_pos is updated from message (should match local but good to sync)
+                    start_pos = sp_val
+                else:
+                    x = None
             else:
-                x = None
-                start_pos = 0
+                # Robust Path (Prefill / Init)
+                if self.tp_rank == 0:
+                    shape = torch.zeros(3, dtype=torch.long)
+                    dist.recv(shape, src=prev_root)
+                    b, s, d = shape.tolist()
+                    x = torch.zeros((b, s, d), dtype=self.config.dtype)
+                    dist.recv(x, src=prev_root)
+                    sp = torch.zeros(1, dtype=torch.long)
+                    dist.recv(sp, src=prev_root)
+                    start_pos = sp.item()
+                else:
+                    x = None
+            
             self.profiler.record_comm(time.perf_counter() - t0)
             
             # Broadcast to TP group
             if self.tp_world_size > 1:
                 t0 = time.perf_counter()
                 if self.tp_rank == 0:
+                    # We can also optimize TP broadcast?
+                    # If start_pos > 0, we know shape is (1,1,D).
+                    # We can broadcast data directly if we assume shape.
+                    # But broadcast is cheap?
+                    # Let's keep TP robust for now or apply similar logic.
                     shape = torch.tensor(x.shape, dtype=torch.long)
                     sp = torch.tensor([start_pos], dtype=torch.long)
                 else:
@@ -505,6 +634,7 @@ class StaticDistributedQwen3Model(nn.Module):
 
         # Stage 0: Embeddings
         if self.my_stage_idx == 0:
+            # ... (Existing TP broadcast logic for Stage 0) ...
             if self.tp_world_size > 1:
                 t0 = time.perf_counter()
                 src_rank = self.stage_ranks[0][0]
@@ -540,9 +670,19 @@ class StaticDistributedQwen3Model(nn.Module):
             if self.tp_rank == 0:
                 t0 = time.perf_counter()
                 next_root = self.stage_ranks[self.my_stage_idx + 1][0]
-                dist.send(torch.tensor(x.shape, dtype=torch.long), dst=next_root)
-                dist.send(x, dst=next_root)
-                dist.send(torch.tensor([start_pos], dtype=torch.long), dst=next_root)
+                
+                # Check condition for optimized send
+                # Must match receiver's logic: start_pos > 0
+                if start_pos > 0 and x.shape[0] == 1 and x.shape[1] == 1:
+                    # Optimized Send
+                    packed_buf = self.comm_manager.pack_decode(x, start_pos)
+                    dist.send(packed_buf, dst=next_root)
+                else:
+                    # Robust Send
+                    dist.send(torch.tensor(x.shape, dtype=torch.long), dst=next_root)
+                    dist.send(x, dst=next_root)
+                    dist.send(torch.tensor([start_pos], dtype=torch.long), dst=next_root)
+                    
                 self.profiler.record_comm(time.perf_counter() - t0)
             return None
         else:
