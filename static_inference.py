@@ -32,36 +32,40 @@ class InferenceProfiler:
         self.reset()
         
     def reset(self):
-        self.records = {}  # layer_idx -> {'compute': 0.0, 'comm': 0.0}
+        self.records = {}  # layer_idx -> {'compute': 0.0, 'comm': 0.0, 'wait': 0.0}
         self.total_compute = 0.0
         self.total_comm = 0.0
+        self.total_wait = 0.0
         
         # Temporary state for current layer
         self._layer_start_time = 0.0
         self._layer_comm_time = 0.0
+        self._layer_wait_time = 0.0
         self._current_layer_idx = None
 
     def start_layer(self, layer_idx):
         self._current_layer_idx = layer_idx
         self._layer_comm_time = 0.0
+        self._layer_wait_time = 0.0
         self._layer_start_time = time.perf_counter()
         if layer_idx not in self.records:
-            self.records[layer_idx] = {'compute': 0.0, 'comm': 0.0}
+            self.records[layer_idx] = {'compute': 0.0, 'comm': 0.0, 'wait': 0.0}
 
     def end_layer(self):
         if self._current_layer_idx is None:
             return
             
         total_duration = time.perf_counter() - self._layer_start_time
-        # Compute time = Total time - Communication time within layer
-        compute_duration = max(0.0, total_duration - self._layer_comm_time)
+        # Compute time = Total time - Communication time - Wait time
+        compute_duration = max(0.0, total_duration - self._layer_comm_time - self._layer_wait_time)
         
         idx = self._current_layer_idx
         self.records[idx]['compute'] += compute_duration
         self.records[idx]['comm'] += self._layer_comm_time
+        self.records[idx]['wait'] += self._layer_wait_time
         
         self.total_compute += compute_duration
-        # total_comm is updated via record_comm
+        # total_comm and total_wait are updated via record methods
         
         self._current_layer_idx = None
 
@@ -69,28 +73,34 @@ class InferenceProfiler:
         self.total_comm += duration
         if self._current_layer_idx is not None:
             self._layer_comm_time += duration
-            
+
     def record_compute(self, duration):
-        # For non-layer computation (e.g. embedding, head)
         self.total_compute += duration
 
+    def record_wait(self, duration):
+        self.total_wait += duration
+        if self._current_layer_idx is not None:
+            self._layer_wait_time += duration
+            
     def print_stats(self, rank):
         print(f"\n[Rank {rank}] === Inference Performance Stats ===")
-        print(f"{'Layer':<10} | {'Compute (s)':<15} | {'Comm (s)':<15} | {'Total (s)':<15}")
-        print("-" * 65)
+        print(f"{'Layer':<10} | {'Compute (s)':<15} | {'Comm (s)':<15} | {'Wait (s)':<15} | {'Total (s)':<15}")
+        print("-" * 85)
         
         sorted_layers = sorted(self.records.keys())
         for idx in sorted_layers:
             comp = self.records[idx]['compute']
             comm = self.records[idx]['comm']
-            total = comp + comm
-            print(f"{idx:<10} | {comp:<15.6f} | {comm:<15.6f} | {total:<15.6f}")
+            wait = self.records[idx]['wait']
+            total = comp + comm + wait
+            print(f"{idx:<10} | {comp:<15.6f} | {comm:<15.6f} | {wait:<15.6f} | {total:<15.6f}")
             
-        print("-" * 65)
+        print("-" * 85)
         print(f"Total Compute: {self.total_compute:.6f} s")
         print(f"Total Comm:    {self.total_comm:.6f} s")
-        print(f"Total Time:    {self.total_compute + self.total_comm:.6f} s")
-        print("=" * 65 + "\n")
+        print(f"Total Wait:    {self.total_wait:.6f} s")
+        print(f"Total Time:    {self.total_compute + self.total_comm + self.total_wait:.6f} s")
+        print("=" * 85 + "\n")
 
 # --- Model Components ---
 
@@ -583,19 +593,37 @@ class StaticDistributedQwen3Model(nn.Module):
             if start_pos > 0:
                 # Optimized Path (Decode)
                 if self.tp_rank == 0:
+                    t0 = time.perf_counter()
+                    # 1. Wait for Signal (Wait Time)
+                    signal = torch.zeros(1, dtype=torch.float64)
+                    dist.recv(signal, src=prev_root)
+                    t1 = time.perf_counter()
+                    self.profiler.record_wait(t1 - t0)
+
+                    # 2. Receive Data (Transfer Time)
                     dist.recv(self.comm_manager.decode_buffer, src=prev_root)
+                    
                     # Unpack
-                    # We trust the sender sent the packed buffer.
-                    # Note: x is created here.
                     x_val, sp_val = self.comm_manager.unpack_decode()
                     x = x_val
-                    # start_pos is updated from message (should match local but good to sync)
+                    # start_pos is updated from message
                     start_pos = sp_val
+                    
+                    t2 = time.perf_counter()
+                    self.profiler.record_comm(t2 - t1)
                 else:
                     x = None
             else:
                 # Robust Path (Prefill / Init)
                 if self.tp_rank == 0:
+                    t0 = time.perf_counter()
+                    # 1. Wait for Signal (Wait Time)
+                    signal = torch.zeros(1, dtype=torch.float64)
+                    dist.recv(signal, src=prev_root)
+                    t1 = time.perf_counter()
+                    self.profiler.record_wait(t1 - t0)
+
+                    # 2. Receive Data (Transfer Time)
                     shape = torch.zeros(3, dtype=torch.long)
                     dist.recv(shape, src=prev_root)
                     b, s, d = shape.tolist()
@@ -604,10 +632,11 @@ class StaticDistributedQwen3Model(nn.Module):
                     sp = torch.zeros(1, dtype=torch.long)
                     dist.recv(sp, src=prev_root)
                     start_pos = sp.item()
+                    
+                    t2 = time.perf_counter()
+                    self.profiler.record_comm(t2 - t1)
                 else:
                     x = None
-            
-            self.profiler.record_comm(time.perf_counter() - t0)
             
             # Broadcast to TP group
             if self.tp_world_size > 1:
@@ -676,10 +705,20 @@ class StaticDistributedQwen3Model(nn.Module):
                 # Must match receiver's logic: start_pos > 0
                 if start_pos > 0 and x.shape[0] == 1 and x.shape[1] == 1:
                     # Optimized Send
+                    # 1. Send Signal
+                    signal = torch.tensor([time.perf_counter()], dtype=torch.float64)
+                    dist.send(signal, dst=next_root)
+                    
+                    # 2. Send Data
                     packed_buf = self.comm_manager.pack_decode(x, start_pos)
                     dist.send(packed_buf, dst=next_root)
                 else:
                     # Robust Send
+                    # 1. Send Signal
+                    signal = torch.tensor([time.perf_counter()], dtype=torch.float64)
+                    dist.send(signal, dst=next_root)
+                    
+                    # 2. Send Data
                     dist.send(torch.tensor(x.shape, dtype=torch.long), dst=next_root)
                     dist.send(x, dst=next_root)
                     dist.send(torch.tensor([start_pos], dtype=torch.long), dst=next_root)
@@ -963,6 +1002,7 @@ def main():
             'records': model.profiler.records,
             'total_compute': model.profiler.total_compute,
             'total_comm': model.profiler.total_comm,
+            'total_wait': model.profiler.total_wait,
         }
         
         # 2. Gather Summaries at Rank 0
@@ -1019,38 +1059,42 @@ def main():
                     # However, simply taking the record from the first rank that has it is usually enough for homogeneous TP.
                     # Or better: average them if multiple ranks have the same layer.
                     if layer_idx not in global_layer_records:
-                        global_layer_records[layer_idx] = {'compute': [], 'comm': []}
+                        global_layer_records[layer_idx] = {'compute': [], 'comm': [], 'wait': []}
                     global_layer_records[layer_idx]['compute'].append(record['compute'])
                     global_layer_records[layer_idx]['comm'].append(record['comm'])
+                    global_layer_records[layer_idx]['wait'].append(record['wait'])
             
             print("Global Layer Statistics (Avg across TP ranks if applicable):")
-            print(f"{'Layer':<10} | {'Compute (s)':<15} | {'Comm (s)':<15} | {'Total (s)':<15}")
-            print("-" * 60)
+            print(f"{'Layer':<10} | {'Compute (s)':<15} | {'Comm (s)':<15} | {'Wait (s)':<15} | {'Total (s)':<15}")
+            print("-" * 85)
             
             sorted_layers = sorted(global_layer_records.keys())
             for idx in sorted_layers:
                 comps = global_layer_records[idx]['compute']
                 comms = global_layer_records[idx]['comm']
+                waits = global_layer_records[idx]['wait']
                 avg_comp = sum(comps) / len(comps)
                 avg_comm = sum(comms) / len(comms)
-                total = avg_comp + avg_comm
-                print(f"{idx:<10} | {avg_comp:<15.6f} | {avg_comm:<15.6f} | {total:<15.6f}")
-            print("-" * 60)
+                avg_wait = sum(waits) / len(waits)
+                total = avg_comp + avg_comm + avg_wait
+                print(f"{idx:<10} | {avg_comp:<15.6f} | {avg_comm:<15.6f} | {avg_wait:<15.6f} | {total:<15.6f}")
+            print("-" * 85)
 
             # Stage Statistics
             print("[Per-Stage Summary]")
-            print(f"{'Stage':<6} | {'Layers':<8} | {'Compute (s)':<12} | {'Comm (s)':<12} | {'Total (s)':<12}")
-            print("-" * 60)
+            print(f"{'Stage':<6} | {'Layers':<8} | {'Compute (s)':<12} | {'Comm (s)':<12} | {'Wait (s)':<12} | {'Total (s)':<12}")
+            print("-" * 85)
             
             # Group summaries by stage
             stage_stats = {}
             for summary in all_summaries:
                 s_idx = summary['stage_idx']
                 if s_idx not in stage_stats:
-                    stage_stats[s_idx] = {'compute': [], 'comm': [], 'layers': 0}
+                    stage_stats[s_idx] = {'compute': [], 'comm': [], 'wait': [], 'layers': 0}
                 
                 stage_stats[s_idx]['compute'].append(summary['total_compute'])
                 stage_stats[s_idx]['comm'].append(summary['total_comm'])
+                stage_stats[s_idx]['wait'].append(summary['total_wait'])
                 stage_stats[s_idx]['layers'] = summary['layers_per_stage'][s_idx]
 
             sorted_stages = sorted(stage_stats.keys())
@@ -1060,9 +1104,11 @@ def main():
             for s_idx in sorted_stages:
                 comps = stage_stats[s_idx]['compute']
                 comms = stage_stats[s_idx]['comm']
+                waits = stage_stats[s_idx]['wait']
                 avg_comp = sum(comps) / len(comps)
                 avg_comm = sum(comms) / len(comms)
-                stage_totals.append((s_idx, avg_comp + avg_comm))
+                avg_wait = sum(waits) / len(waits)
+                stage_totals.append((s_idx, avg_comp + avg_comm + avg_wait))
             
             # Find max total time
             max_total = max(t[1] for t in stage_totals) if stage_totals else 0
@@ -1071,15 +1117,17 @@ def main():
                 # Average across TP ranks in the same stage
                 comps = stage_stats[s_idx]['compute']
                 comms = stage_stats[s_idx]['comm']
+                waits = stage_stats[s_idx]['wait']
                 avg_comp = sum(comps) / len(comps)
                 avg_comm = sum(comms) / len(comms)
-                total = avg_comp + avg_comm
+                avg_wait = sum(waits) / len(waits)
+                total = avg_comp + avg_comm + avg_wait
                 layers_count = stage_stats[s_idx]['layers']
                 
                 bottleneck_mark = "(*)" if abs(total - max_total) < 1e-6 else ""
                 
-                print(f"{s_idx:<6} | {layers_count:<8} | {avg_comp:<12.4f} | {avg_comm:<12.4f} | {total:<12.4f} {bottleneck_mark}")
-            print("=" * 60)
+                print(f"{s_idx:<6} | {layers_count:<8} | {avg_comp:<12.4f} | {avg_comm:<12.4f} | {avg_wait:<12.4f} | {total:<12.4f} {bottleneck_mark}")
+            print("=" * 85)
             print("(*) Indicates Bottleneck Stage")
 
         else:
