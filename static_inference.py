@@ -25,6 +25,72 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Profiler ---
+class InferenceProfiler:
+    def __init__(self):
+        self.reset()
+        
+    def reset(self):
+        self.records = {}  # layer_idx -> {'compute': 0.0, 'comm': 0.0}
+        self.total_compute = 0.0
+        self.total_comm = 0.0
+        
+        # Temporary state for current layer
+        self._layer_start_time = 0.0
+        self._layer_comm_time = 0.0
+        self._current_layer_idx = None
+
+    def start_layer(self, layer_idx):
+        self._current_layer_idx = layer_idx
+        self._layer_comm_time = 0.0
+        self._layer_start_time = time.perf_counter()
+        if layer_idx not in self.records:
+            self.records[layer_idx] = {'compute': 0.0, 'comm': 0.0}
+
+    def end_layer(self):
+        if self._current_layer_idx is None:
+            return
+            
+        total_duration = time.perf_counter() - self._layer_start_time
+        # Compute time = Total time - Communication time within layer
+        compute_duration = max(0.0, total_duration - self._layer_comm_time)
+        
+        idx = self._current_layer_idx
+        self.records[idx]['compute'] += compute_duration
+        self.records[idx]['comm'] += self._layer_comm_time
+        
+        self.total_compute += compute_duration
+        # total_comm is updated via record_comm
+        
+        self._current_layer_idx = None
+
+    def record_comm(self, duration):
+        self.total_comm += duration
+        if self._current_layer_idx is not None:
+            self._layer_comm_time += duration
+            
+    def record_compute(self, duration):
+        # For non-layer computation (e.g. embedding, head)
+        self.total_compute += duration
+
+    def print_stats(self, rank):
+        print(f"\n[Rank {rank}] === Inference Performance Stats ===")
+        print(f"{'Layer':<10} | {'Compute (s)':<15} | {'Comm (s)':<15} | {'Total (s)':<15}")
+        print("-" * 65)
+        
+        sorted_layers = sorted(self.records.keys())
+        for idx in sorted_layers:
+            comp = self.records[idx]['compute']
+            comm = self.records[idx]['comm']
+            total = comp + comm
+            print(f"{idx:<10} | {comp:<15.6f} | {comm:<15.6f} | {total:<15.6f}")
+            
+        print("-" * 65)
+        print(f"Total Compute: {self.total_compute:.6f} s")
+        print(f"Total Comm:    {self.total_comm:.6f} s")
+        print(f"Total Time:    {self.total_compute + self.total_comm:.6f} s")
+        print("=" * 65 + "\n")
+
 # --- Model Components ---
 
 class RMSNorm(nn.Module):
@@ -67,11 +133,12 @@ def apply_rope(x, cos, sin, offset=0):
     return x_rotated.to(dtype=x.dtype)
 
 class FeedForward(nn.Module):
-    def __init__(self, cfg, tp_rank, tp_world_size, tp_group=None, tp_ratios=None):
+    def __init__(self, cfg, tp_rank, tp_world_size, tp_group=None, tp_ratios=None, profiler=None):
         super().__init__()
         self.tp_rank = tp_rank
         self.tp_world_size = tp_world_size
         self.tp_group = tp_group
+        self.profiler = profiler
         self.hidden_dim = cfg.hidden_dim
         self.emb_dim = cfg.emb_dim
         
@@ -101,16 +168,20 @@ class FeedForward(nn.Module):
         x_out = self.fc3(x_intermediate)
         
         if self.tp_world_size > 1:
+            t0 = time.perf_counter()
             dist.all_reduce(x_out, op=dist.ReduceOp.SUM, group=self.tp_group)
+            if self.profiler:
+                self.profiler.record_comm(time.perf_counter() - t0)
             
         return x_out
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, cfg, tp_rank, tp_world_size, tp_group=None, tp_ratios=None):
+    def __init__(self, cfg, tp_rank, tp_world_size, tp_group=None, tp_ratios=None, profiler=None):
         super().__init__()
         self.tp_rank = tp_rank
         self.tp_world_size = tp_world_size
         self.tp_group = tp_group
+        self.profiler = profiler
         self.num_heads = cfg.n_heads
         self.num_kv_groups = cfg.n_kv_groups
         self.head_dim = cfg.head_dim
@@ -227,15 +298,18 @@ class GroupedQueryAttention(nn.Module):
         out = self.out_proj(context)
         
         if self.tp_world_size > 1:
+            t0 = time.perf_counter()
             dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.tp_group)
+            if self.profiler:
+                self.profiler.record_comm(time.perf_counter() - t0)
             
         return out
 
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg, tp_rank, tp_world_size, tp_group=None, tp_ratios=None):
+    def __init__(self, cfg, tp_rank, tp_world_size, tp_group=None, tp_ratios=None, profiler=None):
         super().__init__()
-        self.att = GroupedQueryAttention(cfg, tp_rank, tp_world_size, tp_group, tp_ratios)
-        self.ff = FeedForward(cfg, tp_rank, tp_world_size, tp_group, tp_ratios)
+        self.att = GroupedQueryAttention(cfg, tp_rank, tp_world_size, tp_group, tp_ratios, profiler)
+        self.ff = FeedForward(cfg, tp_rank, tp_world_size, tp_group, tp_ratios, profiler)
         self.norm1 = RMSNorm(cfg.emb_dim, eps=1e-6)
         self.norm2 = RMSNorm(cfg.emb_dim, eps=1e-6)
 
@@ -267,6 +341,7 @@ class StaticDistributedQwen3Model(nn.Module):
         super().__init__()
         self.config = config
         self.tp_group = tp_group
+        self.profiler = InferenceProfiler()
         self.my_rank = my_config['my_rank']
         self.world_size = my_config['world_size']
         self.my_stage_idx = my_config['my_stage_idx']
@@ -285,7 +360,7 @@ class StaticDistributedQwen3Model(nn.Module):
         logger.info(f"[Rank {self.my_rank}] Stage {self.my_stage_idx}, TP {self.tp_rank}/{self.tp_world_size}, Layers {self.start_layer}-{self.start_layer+self.num_layers-1}, Ratios: {self.tp_ratios}")
         
         self.layers = nn.ModuleList([
-            TransformerBlock(config, self.tp_rank, self.tp_world_size, self.tp_group, self.tp_ratios) 
+            TransformerBlock(config, self.tp_rank, self.tp_world_size, self.tp_group, self.tp_ratios, self.profiler) 
             for _ in range(self.num_layers)
         ])
         
@@ -393,6 +468,7 @@ class StaticDistributedQwen3Model(nn.Module):
     def forward(self, x, start_pos=0):
         # Stage > 0: Receive from Prev Stage
         if self.my_stage_idx > 0:
+            t0 = time.perf_counter()
             prev_root = self.stage_ranks[self.my_stage_idx - 1][0]
             if self.tp_rank == 0:
                 shape = torch.zeros(3, dtype=torch.long)
@@ -406,9 +482,11 @@ class StaticDistributedQwen3Model(nn.Module):
             else:
                 x = None
                 start_pos = 0
+            self.profiler.record_comm(time.perf_counter() - t0)
             
             # Broadcast to TP group
             if self.tp_world_size > 1:
+                t0 = time.perf_counter()
                 if self.tp_rank == 0:
                     shape = torch.tensor(x.shape, dtype=torch.long)
                     sp = torch.tensor([start_pos], dtype=torch.long)
@@ -423,10 +501,12 @@ class StaticDistributedQwen3Model(nn.Module):
                 dist.broadcast(x, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
                 dist.broadcast(sp, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
                 start_pos = sp.item()
+                self.profiler.record_comm(time.perf_counter() - t0)
 
         # Stage 0: Embeddings
         if self.my_stage_idx == 0:
             if self.tp_world_size > 1:
+                t0 = time.perf_counter()
                 src_rank = self.stage_ranks[0][0]
                 if self.tp_rank == 0:
                     shape = torch.tensor(x.shape, dtype=torch.long)
@@ -437,8 +517,11 @@ class StaticDistributedQwen3Model(nn.Module):
                     dist.broadcast(shape, src=src_rank, group=self.tp_group)
                     x = torch.zeros(tuple(shape.tolist()), dtype=torch.long)
                     dist.broadcast(x, src=src_rank, group=self.tp_group)
+                self.profiler.record_comm(time.perf_counter() - t0)
             
+            t0 = time.perf_counter()
             x = self.tok_emb(x)
+            self.profiler.record_compute(time.perf_counter() - t0)
 
         # Layers
         b, seq, _ = x.shape
@@ -446,19 +529,27 @@ class StaticDistributedQwen3Model(nn.Module):
         if seq > 1:
             mask = torch.triu(torch.ones(seq, seq, dtype=torch.bool), diagonal=1).to(x.device)
             
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            layer_idx = self.start_layer + i
+            self.profiler.start_layer(layer_idx)
             x = layer(x, mask, self.cos, self.sin, start_pos=start_pos)
+            self.profiler.end_layer()
             
         # Send to Next Stage or Return Logits
         if self.my_stage_idx < len(self.stage_ranks) - 1:
             if self.tp_rank == 0:
+                t0 = time.perf_counter()
                 next_root = self.stage_ranks[self.my_stage_idx + 1][0]
                 dist.send(torch.tensor(x.shape, dtype=torch.long), dst=next_root)
                 dist.send(x, dst=next_root)
                 dist.send(torch.tensor([start_pos], dtype=torch.long), dst=next_root)
+                self.profiler.record_comm(time.perf_counter() - t0)
             return None
         else:
+            t0 = time.perf_counter()
             x = self.final_norm(x)
+            self.profiler.record_compute(time.perf_counter() - t0)
+            
             if self.tp_world_size > 1:
                 # If TP > 1, hidden states might be split or need aggregation if coming from a split layer
                 # But here, TransformerBlock output is already aggregated if it was split (e.g. FFN output AllReduce)
@@ -469,9 +560,11 @@ class StaticDistributedQwen3Model(nn.Module):
             
             # Only Rank 0 of the last stage computes logits to save computation
             if self.tp_rank == 0:
-                return self.out_head(x)
-            else:
-                return None
+                t0 = time.perf_counter()
+                logits = self.out_head(x)
+                self.profiler.record_compute(time.perf_counter() - t0)
+                return logits
+            return None
 
 def parse_allocation_config(config_str: str, ip_list: List[str]) -> dict:
     stages_config = config_str.split('*')
@@ -643,6 +736,7 @@ def main():
     last_stage_idx = len(my_config['stage_ranks']) - 1
     token_src_rank = my_config['stage_ranks'][last_stage_idx][0]
 
+    model.profiler.reset()
     for i in range(20):
         # 1. Run Model Step
         if my_config['my_rank'] == 0:
@@ -698,6 +792,8 @@ def main():
     if my_config['my_rank'] == 0:
         print("\n")
             
+    model.profiler.print_stats(my_config['my_rank'])
+
     if HAS_DISTRIBUTED:
         dist.destroy_process_group()
 
