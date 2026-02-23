@@ -375,8 +375,10 @@ class CommManager:
         # Structure: [batch(1), seq(1), hidden_dim, start_pos(1), task_id(1), data(1*1*hidden_dim)]
         # Total size: 5 + hidden_dim floats
         self.decode_buffer_size = 5 + hidden_dim
-        # Map task_id -> buffer
+        # Map task_id -> buffer (for sending)
         self.decode_buffers = {}
+        # Shared receive buffer (for receiving, task_id unknown beforehand)
+        self.shared_recv_buffer = torch.zeros(self.decode_buffer_size, dtype=self.dtype, device=self.device)
         # Map task_id -> signal buffer
         self.signal_buffers = {}
         # Map task_id -> active send request (list or single)
@@ -435,6 +437,23 @@ class CommManager:
         if task_id not in self.decode_buffers:
             self.decode_buffers[task_id] = torch.zeros(self.decode_buffer_size, dtype=self.dtype, device=self.device)
         return self.decode_buffers[task_id]
+    
+    def get_shared_recv_buffer(self):
+        """Get shared receive buffer (task_id unknown beforehand)"""
+        return self.shared_recv_buffer
+    
+    def unpack_shared_buffer(self):
+        """Unpack shared receive buffer, returns (x, start_pos, task_id)"""
+        buffer = self.shared_recv_buffer
+        
+        b = int(buffer[0].item())
+        s = int(buffer[1].item())
+        d = int(buffer[2].item())
+        start_pos = int(buffer[3].item())
+        task_id = int(buffer[4].item())
+        
+        x = buffer[5:].view(b, s, d).clone()
+        return x, start_pos, task_id
 
     def unpack_decode(self, task_id):
         """Unpack decode_buffer for specific task into x and start_pos"""
@@ -695,20 +714,16 @@ class StaticDistributedQwen3Model(nn.Module):
                     self.profiler.record_wait(t1 - t0)
 
                     # 2. Receive Data (Transfer Time)
-                    # Use specific buffer for this task
-                    recv_buf = self.comm_manager.get_recv_buffer(task_id)
+                    # Use shared buffer since task_id is unknown beforehand
+                    recv_buf = self.comm_manager.get_shared_recv_buffer()
                     dist.recv(recv_buf, src=prev_root)
                     
-                    # Unpack
-                    x_val, sp_val, tid_val = self.comm_manager.unpack_decode(task_id)
-                    
-                    if tid_val != task_id:
-                        logger.warning(f"[Rank {self.my_rank}] Task ID mismatch in optimized recv: expected {task_id}, got {tid_val}")
+                    # Unpack and get actual task_id from message
+                    x_val, sp_val, tid_val = self.comm_manager.unpack_shared_buffer()
                     
                     x = x_val
-                    # start_pos is updated from message
                     start_pos = sp_val
-                    # task_id = tid_val # Trust local task_id from loop
+                    task_id = tid_val
                     
                     t2 = time.perf_counter()
                     self.profiler.record_comm(t2 - t1)
