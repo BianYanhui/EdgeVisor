@@ -612,10 +612,19 @@ class OptimizedDistributedQwen3Model(nn.Module):
                     req = dist.isend(packed_buf, dst=next_root)
                     self.comm_manager.register_send_req(task_id, req)
                 else:
-                    # Robust Send (Prompt Phase): Meta + Data
+                    # Robust Send (Prompt Phase): Meta + Data -> Now Async
                     meta_buf = self.comm_manager.pack_meta(x.shape, start_pos, task_id)
-                    dist.send(meta_buf, dst=next_root)
-                    dist.send(x, dst=next_root)
+                    req_meta = dist.isend(meta_buf, dst=next_root)
+                    
+                    # Ensure x is contiguous and ready for sending
+                    if not x.is_contiguous(): x = x.contiguous()
+                    # We need to keep a reference to x until send is complete, 
+                    # but since we are in a loop and x is overwritten or discarded, 
+                    # we should register it in comm_manager or rely on Python's ref counting if we block later.
+                    # For safety in async pipeline, we register the request.
+                    req_data = dist.isend(x, dst=next_root)
+                    
+                    self.comm_manager.register_send_req(task_id, [req_meta, req_data])
                     
                 self.profiler.record_comm(time.perf_counter() - t0)
             return None
@@ -751,6 +760,13 @@ def main():
     tasks = []
     tokenizer = None
     
+    # Define prompts for multi-task pipeline testing
+    prompts = [
+        "The capital of France is",
+        "Artificial Intelligence will", 
+        "Python is popular because"
+    ]
+    
     if my_config['my_rank'] == 0:
         if args.tokenizer:
             # Try loading HuggingFace tokenizer
@@ -773,23 +789,41 @@ def main():
                             return ids
                         def decode(self, ids):
                             if isinstance(ids, torch.Tensor): ids = ids.tolist()
-                            return self.enc.decode(ids)
+                            # Filter out invalid tokens that cl100k_base doesn't support
+                            # cl100k_base vocab size is ~100k, Qwen is ~152k.
+                            # We need to clamp or ignore OOV tokens to avoid crash.
+                            valid_ids = []
+                            for i in ids:
+                                try:
+                                    # Try to see if it's in range by encoding it back or just checking max
+                                    # But simpler is to catch the error per token or just filter by known max
+                                    # cl100k_base max token is 100277 (approx).
+                                    # Let's try to decode one by one and skip errors
+                                    self.enc.decode([i])
+                                    valid_ids.append(i)
+                                except Exception:
+                                    pass
+                            return self.enc.decode(valid_ids)
                     tokenizer = TiktokenWrapper()
                 except ImportError:
                     logger.error("Tiktoken not found either. Using Dummy.")
                     tokenizer = None
         
-        prompt_list = ["Hello"] # Default
         if tokenizer:
-            print(f"\n[Rank 0] Initializing task with prompt: {prompt_list[0]}")
-            tasks.append(TaskState(0, prompt_list[0], tokenizer=tokenizer))
+            print(f"\n[Rank 0] Initializing {len(prompts)} tasks for Pipeline Parallelism...")
+            for i, p in enumerate(prompts):
+                print(f"  Task {i}: {p}")
+                tasks.append(TaskState(i, p, tokenizer=tokenizer))
         else:
             # Dummy task for testing without tokenizer
-            print(f"\n[Rank 0] Initializing dummy task")
-            tasks.append(TaskState(0, "Dummy", input_ids=torch.tensor([[1, 2, 3]])))
+            print(f"\n[Rank 0] Initializing dummy tasks")
+            for i in range(len(prompts)):
+                tasks.append(TaskState(i, "Dummy", input_ids=torch.tensor([[1, 2, 3]])))
     else:
-        # Other ranks initialize dummy tasks
-        tasks.append(TaskState(0, "", input_ids=None))
+        # Other ranks initialize dummy tasks to match the count
+        # They don't need prompts, just the task structure
+        for i in range(len(prompts)):
+            tasks.append(TaskState(i, "", input_ids=None))
 
     # Identify the rank that will broadcast the sampled token (Root of the last stage)
     last_stage_idx = len(my_config['stage_ranks']) - 1
@@ -812,6 +846,15 @@ def main():
             if my_config['my_rank'] == 0 and task.token_count == 0 and task.start_time == 0.0:
                 task.start_time = time.perf_counter()
 
+            # --- Multi-Task Pipeline Logic ---
+            # By iterating through tasks, we naturally implement a pipeline.
+            # Stage 0 sends Task A, then immediately processes Task B.
+            # Stage 1 receives Task A, processes it. 
+            # In the next iteration of the inner loop (or next receive call), Stage 1 receives Task B.
+            # The key is that Stage 0 does NOT wait for Stage 1 to finish Task A before starting Task B.
+            # The send operation in Stage 0 is non-blocking (or fast blocking), allowing it to proceed.
+            # ---------------------------------
+
             if my_config['my_rank'] == 0:
                 logits = model(task.curr_input_ids, start_pos=task.start_pos, task_id=task.task_id)
             else:
@@ -821,11 +864,18 @@ def main():
                 step_logits[task.task_id] = logits
 
         # 2. Sample and Broadcast
+        # Note: This acts as a synchronization barrier for the pipeline batch.
+        # All tasks in this 'micro-batch' must finish their forward pass before we sample and broadcast.
+        # This is similar to GPipe's F-then-B schedule but for inference.
         for task in tasks:
             if task.is_complete: continue
             
             payload = torch.zeros(4, dtype=torch.long)
             if my_config['my_rank'] == token_src_rank:
+                if task.task_id not in step_logits:
+                     # Should not happen if logic is correct
+                     logger.error(f"Missing logits for task {task.task_id}")
+                     continue
                 logits = step_logits[task.task_id]
                 next_token_val = torch.argmax(logits[:, -1, :], dim=-1).item()
                 step_len = logits.shape[1]
@@ -837,12 +887,21 @@ def main():
                 payload[3] = is_task_complete
             
             if HAS_DISTRIBUTED:
+                # We need to broadcast from the source rank
+                # But wait, dist.broadcast is a collective call.
+                # All ranks must call it.
+                # The source rank is token_src_rank.
                 dist.broadcast(payload, src=token_src_rank)
             
             token_val = payload[0].item()
             step_len_val = payload[1].item()
+            task_id_val = payload[2].item()
             is_complete_val = payload[3].item()
             
+            # Sanity check
+            if task_id_val != task.task_id:
+                logger.warning(f"Rank {my_config['my_rank']} received token for task {task_id_val} but expected {task.task_id}. Order mismatch?")
+
             task.start_pos += step_len_val
             task.token_count += 1
             if is_complete_val == 1: task.is_complete = True
