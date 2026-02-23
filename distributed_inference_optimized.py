@@ -853,6 +853,10 @@ def main():
                 if task.is_complete:
                     task.end_time = time.perf_counter()
                     print(f"\n[Rank 0] Task {task.task_id} Completed! Duration: {task.end_time - task.start_time:.2f}s")
+                    if tokenizer:
+                        # Decode and print the generated text
+                        output_text = tokenizer.decode(task.generated_ids)
+                        print(f"[Rank 0] Generated Text:\n{output_text}\n")
 
     # Print Profiler Stats for ALL ranks
     print(f"\n[Rank {my_config['my_rank']}] Performance Stats:")
