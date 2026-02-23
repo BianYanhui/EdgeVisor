@@ -101,6 +101,24 @@ class InferenceProfiler:
         self.total_wait += duration
         if self._current_layer_idx is not None: self._layer_wait_time += duration
 
+    def print_stats(self):
+        total_time = self.total_compute + self.total_comm + self.total_wait
+        if total_time == 0: return
+        
+        print("-" * 60)
+        print(f"Performance Report:")
+        print(f"Total Time:     {total_time:.4f} s")
+        print(f"Compute Time:   {self.total_compute:.4f} s ({self.total_compute/total_time*100:.1f}%)")
+        print(f"Comm Time:      {self.total_comm:.4f} s ({self.total_comm/total_time*100:.1f}%)")
+        print(f"Wait/Idle Time: {self.total_wait:.4f} s ({self.total_wait/total_time*100:.1f}%)")
+        
+        # Breakdown by layer type (first layer only as sample)
+        first_layer = min(self.records.keys()) if self.records else -1
+        if first_layer != -1:
+            rec = self.records[first_layer]
+            print(f"Sample Layer {first_layer}: Compute={rec['compute']*1000:.2f}ms, Comm={rec['comm']*1000:.2f}ms")
+        print("-" * 60)
+
 # --- Optimization Components ---
 
 class QuantizedLinear(nn.Module):
@@ -789,6 +807,10 @@ def main():
                 if task.is_complete:
                     task.end_time = time.perf_counter()
                     print(f"\n[Rank 0] Task {task.task_id} Completed! Duration: {task.end_time - task.start_time:.2f}s")
+
+    # Print Profiler Stats for ALL ranks
+    print(f"\n[Rank {my_config['my_rank']}] Performance Stats:")
+    model.profiler.print_stats()
 
     if HAS_DISTRIBUTED:
         dist.destroy_process_group()
