@@ -168,11 +168,11 @@ class CommManager:
         self.hidden_dim = hidden_dim
         self.dtype = dtype
         self.device = device
-        # Buffer structure: [batch(1), seq(1), dim(1), start_pos(1), task_id(1), data(...)]
-        self.decode_buffer_size = 5 + hidden_dim
+        # Buffer structure: [batch(1), seq(1), dim(1), start_pos(1), task_id(1), timestamp(1), data(...)]
+        self.decode_buffer_size = 6 + hidden_dim
         self.decode_buffers = {} # task_id -> buffer
         self.shared_recv_buffer = torch.zeros(self.decode_buffer_size, dtype=self.dtype, device=self.device)
-        self.signal_buffers = {} # task_id -> signal
+        self.meta_buffer = torch.zeros(6, dtype=torch.float64, device=self.device) # Fixed size metadata buffer
         self.send_reqs = {} # task_id -> req
 
     def pack_decode(self, x: torch.Tensor, start_pos: int, task_id: int):
@@ -182,13 +182,16 @@ class CommManager:
         buffer = self.decode_buffers[task_id]
         buffer[0], buffer[1], buffer[2] = 1.0, 1.0, float(self.hidden_dim)
         buffer[3], buffer[4] = float(start_pos), float(task_id)
-        buffer[5:].copy_(x.flatten())
+        buffer[5] = time.perf_counter()
+        buffer[6:].copy_(x.flatten())
         return buffer
 
-    def get_signal_buffer(self, task_id):
-        if task_id not in self.signal_buffers:
-            self.signal_buffers[task_id] = torch.zeros(1, dtype=torch.float64, device=self.device)
-        return self.signal_buffers[task_id]
+    def pack_meta(self, shape, start_pos, task_id):
+        # shape: (b, s, d)
+        self.meta_buffer[0], self.meta_buffer[1], self.meta_buffer[2] = float(shape[0]), float(shape[1]), float(shape[2])
+        self.meta_buffer[3], self.meta_buffer[4] = float(start_pos), float(task_id)
+        self.meta_buffer[5] = time.perf_counter()
+        return self.meta_buffer
 
     def register_send_req(self, task_id, req):
         self.ensure_send_complete(task_id)
@@ -210,8 +213,18 @@ class CommManager:
         buffer = self.shared_recv_buffer
         b, s, d = int(buffer[0].item()), int(buffer[1].item()), int(buffer[2].item())
         start_pos, task_id = int(buffer[3].item()), int(buffer[4].item())
-        x = buffer[5:].view(b, s, d).clone()
-        return x, start_pos, task_id
+        timestamp = buffer[5].item()
+        x = buffer[6:].view(b, s, d).clone()
+        return x, start_pos, task_id, timestamp
+        
+    def get_meta_buffer(self):
+        return self.meta_buffer
+        
+    def unpack_meta_buffer(self):
+        b, s, d = int(self.meta_buffer[0].item()), int(self.meta_buffer[1].item()), int(self.meta_buffer[2].item())
+        start_pos, task_id = int(self.meta_buffer[3].item()), int(self.meta_buffer[4].item())
+        timestamp = self.meta_buffer[5].item()
+        return (b, s, d), start_pos, task_id, timestamp
 
 # --- Model Components ---
 
@@ -505,27 +518,17 @@ class OptimizedDistributedQwen3Model(nn.Module):
             if self.tp_rank == 0:
                 t0 = time.perf_counter()
                 if start_pos > 0:
-                    # Optimized Receive
-                    signal = torch.zeros(1, dtype=torch.float64)
-                    dist.recv(signal, src=prev_root)
+                    # Optimized Receive (Decode Phase): Single Packed Buffer
                     recv_buf = self.comm_manager.get_shared_recv_buffer()
                     dist.recv(recv_buf, src=prev_root)
-                    x, start_pos, task_id = self.comm_manager.unpack_shared_buffer()
+                    x, start_pos, task_id, timestamp = self.comm_manager.unpack_shared_buffer()
                 else:
-                    # Robust Receive
-                    signal = torch.zeros(1, dtype=torch.float64)
-                    dist.recv(signal, src=prev_root)
-                    shape = torch.zeros(3, dtype=torch.long)
-                    dist.recv(shape, src=prev_root)
-                    b, s, d = shape.tolist()
+                    # Robust Receive (Prompt Phase): Meta + Data
+                    meta_buf = self.comm_manager.get_meta_buffer()
+                    dist.recv(meta_buf, src=prev_root)
+                    (b, s, d), start_pos, task_id, timestamp = self.comm_manager.unpack_meta_buffer()
                     x = torch.zeros((b, s, d), dtype=self.config.dtype)
                     dist.recv(x, src=prev_root)
-                    sp = torch.zeros(1, dtype=torch.long)
-                    dist.recv(sp, src=prev_root)
-                    start_pos = sp.item()
-                    tid = torch.zeros(1, dtype=torch.long)
-                    dist.recv(tid, src=prev_root)
-                    task_id = tid.item()
                 self.profiler.record_comm(time.perf_counter() - t0)
             else:
                 x = None
@@ -533,43 +536,54 @@ class OptimizedDistributedQwen3Model(nn.Module):
             # Broadcast to TP group
             if self.tp_world_size > 1:
                 t0 = time.perf_counter()
-                if self.tp_rank == 0:
-                    shape = torch.tensor(x.shape, dtype=torch.long)
-                    sp = torch.tensor([start_pos], dtype=torch.long)
-                    tid = torch.tensor([task_id], dtype=torch.long)
-                else:
-                    shape = torch.zeros(3, dtype=torch.long)
-                    sp = torch.zeros(1, dtype=torch.long)
-                    tid = torch.zeros(1, dtype=torch.long)
+                root = self.stage_ranks[self.my_stage_idx][0]
                 
-                dist.broadcast(shape, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
-                if self.tp_rank != 0:
-                    x = torch.zeros(tuple(shape.tolist()), dtype=self.config.dtype)
-                dist.broadcast(x, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
-                dist.broadcast(sp, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
-                dist.broadcast(tid, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
-                start_pos = sp.item()
-                task_id = tid.item()
+                if start_pos > 0:
+                    # Decode Phase: Broadcast Packed Buffer
+                    # Note: If we are rank 0, we already have data in shared_recv_buffer or packed_buffer?
+                    # We just unpacked it. We should repack or use the buffer we received.
+                    # The shared_recv_buffer in comm_manager holds the data for Rank 0.
+                    recv_buf = self.comm_manager.get_shared_recv_buffer()
+                    dist.broadcast(recv_buf, src=root, group=self.tp_group)
+                    if self.tp_rank != 0:
+                        x, start_pos, task_id, timestamp = self.comm_manager.unpack_shared_buffer()
+                else:
+                    # Prompt Phase: Broadcast Meta + Data
+                    meta_buf = self.comm_manager.get_meta_buffer()
+                    if self.tp_rank == 0:
+                         # We already have meta_buf populated from receive
+                         pass 
+                    dist.broadcast(meta_buf, src=root, group=self.tp_group)
+                    
+                    if self.tp_rank != 0:
+                        (b, s, d), start_pos, task_id, timestamp = self.comm_manager.unpack_meta_buffer()
+                        x = torch.zeros((b, s, d), dtype=self.config.dtype)
+                    
+                    dist.broadcast(x, src=root, group=self.tp_group)
+
                 self.profiler.record_comm(time.perf_counter() - t0)
 
         # Stage 0: Embeddings
         if self.my_stage_idx == 0:
             if self.tp_world_size > 1:
-                # Broadcast input_ids from TP rank 0 to others in Stage 0
+                t0 = time.perf_counter()
+                root = self.stage_ranks[self.my_stage_idx][0]
+                
                 if self.tp_rank == 0:
                     shape = torch.tensor(x.shape, dtype=torch.long)
                 else:
                     shape = torch.zeros(2, dtype=torch.long)
                 
-                # Broadcast shape first
-                dist.broadcast(shape, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
+                # Broadcast shape
+                dist.broadcast(shape, src=root, group=self.tp_group)
                 
-                # Prepare buffer for receivers
+                # Prepare buffer
                 if self.tp_rank != 0:
                     x = torch.zeros(tuple(shape.tolist()), dtype=torch.long)
                 
                 # Broadcast data
-                dist.broadcast(x, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
+                dist.broadcast(x, src=root, group=self.tp_group)
+                self.profiler.record_comm(time.perf_counter() - t0)
 
             t0 = time.perf_counter()
             x = self.tok_embeddings(x)
@@ -591,22 +605,18 @@ class OptimizedDistributedQwen3Model(nn.Module):
             if self.tp_rank == 0:
                 t0 = time.perf_counter()
                 next_root = self.stage_ranks[self.my_stage_idx + 1][0]
+                
                 if start_pos > 0 and x.shape[1] == 1:
-                    # Optimized Send
-                    sig_buf = self.comm_manager.get_signal_buffer(task_id)
-                    sig_buf[0] = time.perf_counter()
-                    req_sig = dist.isend(sig_buf, dst=next_root)
+                    # Optimized Send (Decode Phase): Single Packed Buffer
                     packed_buf = self.comm_manager.pack_decode(x, start_pos, task_id)
-                    req_data = dist.isend(packed_buf, dst=next_root)
-                    self.comm_manager.register_send_req(task_id, [req_sig, req_data])
+                    req = dist.isend(packed_buf, dst=next_root)
+                    self.comm_manager.register_send_req(task_id, req)
                 else:
-                    # Robust Send
-                    signal = torch.tensor([time.perf_counter()], dtype=torch.float64)
-                    dist.send(signal, dst=next_root)
-                    dist.send(torch.tensor(x.shape, dtype=torch.long), dst=next_root)
+                    # Robust Send (Prompt Phase): Meta + Data
+                    meta_buf = self.comm_manager.pack_meta(x.shape, start_pos, task_id)
+                    dist.send(meta_buf, dst=next_root)
                     dist.send(x, dst=next_root)
-                    dist.send(torch.tensor([start_pos], dtype=torch.long), dst=next_root)
-                    dist.send(torch.tensor([task_id], dtype=torch.long), dst=next_root)
+                    
                 self.profiler.record_comm(time.perf_counter() - t0)
             return None
         else:
