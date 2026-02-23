@@ -794,9 +794,10 @@ class StaticDistributedQwen3Model(nn.Module):
 
         # Layers
         b, seq, _ = x.shape
+        kv_seq_len = start_pos + seq
         mask = None
-        if seq > 1:
-            mask = torch.triu(torch.ones(seq, seq, dtype=torch.bool), diagonal=1).to(x.device)
+        if seq > 1 or start_pos > 0:
+            mask = torch.triu(torch.ones(seq, kv_seq_len, dtype=torch.bool), diagonal=start_pos + 1).to(x.device)
             
         for i, layer in enumerate(self.layers):
             layer_idx = self.start_layer + i
