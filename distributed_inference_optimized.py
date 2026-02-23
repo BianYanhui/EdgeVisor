@@ -1,6 +1,14 @@
 
 import os
 import sys
+
+# --- Fix for Jetson .local path ---
+# Ensure local site-packages are included, especially for tiktoken/transformers
+local_site_packages = os.path.expanduser("~/.local/lib/python3.10/site-packages")
+if os.path.exists(local_site_packages) and local_site_packages not in sys.path:
+    sys.path.insert(0, local_site_packages)
+# ----------------------------------
+
 import json
 import argparse
 import socket
