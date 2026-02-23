@@ -15,6 +15,8 @@ except ImportError:
     HAS_DISTRIBUTED = False
 import torch.multiprocessing as mp
 from safetensors.torch import load_file
+from safetensors import safe_open
+import gc
 from transformers import AutoTokenizer
 from typing import List, Dict, Tuple, Any
 import logging
@@ -499,65 +501,77 @@ class StaticDistributedQwen3Model(nn.Module):
             self.out_head = nn.Linear(config.emb_dim, config.vocab_size, bias=False, dtype=config.dtype)
 
     def load_weights(self, model_path):
-        logger.info(f"[Rank {self.my_rank}] Loading weights...")
-        state_dict = load_file(model_path)
+        logger.info(f"[Rank {self.my_rank}] Loading weights with lazy loading...")
         
+        def get_tensor(key):
+            with safe_open(model_path, framework="pt", device="cpu") as f:
+                return f.get_tensor(key)
+        
+        def load_split(target, key, dim):
+            w = get_tensor(key)
+            total_ratio = sum(self.tp_ratios)
+            dim_size = w.shape[dim]
+            size_per_ratio = dim_size / total_ratio
+            
+            start = int(round(sum(self.tp_ratios[:self.tp_rank]) * size_per_ratio))
+            end = int(round(sum(self.tp_ratios[:self.tp_rank + 1]) * size_per_ratio))
+            
+            if dim == 0:
+                target.data.copy_(w[start:end])
+            else:
+                target.data.copy_(w[:, start:end])
+            del w
+            gc.collect()
+
+        def load_split_heads(target, key, dim, num_groups, head_dim, indices=None):
+            w = get_tensor(key)
+            total_ratio = sum(self.tp_ratios)
+            
+            if indices is None:
+                start_ratio = sum(self.tp_ratios[:self.tp_rank])
+                end_ratio = sum(self.tp_ratios[:self.tp_rank + 1])
+                
+                start_group = int(round(start_ratio * num_groups / total_ratio))
+                end_group = int(round(end_ratio * num_groups / total_ratio))
+                
+                start_idx = start_group * head_dim
+                end_idx = end_group * head_dim
+                
+                if start_idx == end_idx:
+                    del w
+                    gc.collect()
+                    return
+
+                if dim == 0:
+                    target.data.copy_(w[start_idx:end_idx])
+                else:
+                    target.data.copy_(w[:, start_idx:end_idx])
+            else:
+                if len(indices) == 0:
+                    del w
+                    gc.collect()
+                    return
+                    
+                slices = []
+                for idx in indices:
+                    start = idx * head_dim
+                    end = (idx + 1) * head_dim
+                    if dim == 0:
+                        slices.append(w[start:end])
+                    else:
+                        slices.append(w[:, start:end])
+                
+                if dim == 0:
+                    target.data.copy_(torch.cat(slices, dim=0))
+                else:
+                    target.data.copy_(torch.cat(slices, dim=1))
+            
+            del w
+            gc.collect()
+
         def load_layer_weights(layer_idx, block):
             prefix = f"model.layers.{layer_idx}."
             
-            def load_split(target, key, dim):
-                w = state_dict[key]
-                total_ratio = sum(self.tp_ratios)
-                dim_size = w.shape[dim]
-                size_per_ratio = dim_size / total_ratio
-                
-                # Calculate current rank split position
-                start = int(round(sum(self.tp_ratios[:self.tp_rank]) * size_per_ratio))
-                end = int(round(sum(self.tp_ratios[:self.tp_rank + 1]) * size_per_ratio))
-                
-                if dim == 0: target.data.copy_(w[start:end])
-                else: target.data.copy_(w[:, start:end])
-
-            def load_split_heads(target, key, dim, num_groups, head_dim, indices=None):
-                w = state_dict[key]
-                total_ratio = sum(self.tp_ratios)
-                
-                if indices is None:
-                    # Calculate start/end based on GROUPS to match __init__ logic
-                    start_ratio = sum(self.tp_ratios[:self.tp_rank])
-                    end_ratio = sum(self.tp_ratios[:self.tp_rank + 1])
-                    
-                    start_group = int(round(start_ratio * num_groups / total_ratio))
-                    end_group = int(round(end_ratio * num_groups / total_ratio))
-                    
-                    start_idx = start_group * head_dim
-                    end_idx = end_group * head_dim
-                    
-                    # If target is empty (local_groups=0), skip copy
-                    if start_idx == end_idx:
-                        return
-
-                    if dim == 0: target.data.copy_(w[start_idx:end_idx])
-                    else: target.data.copy_(w[:, start_idx:end_idx])
-                else:
-                    # Load specific indices
-                    if len(indices) == 0:
-                        return
-                        
-                    slices = []
-                    for idx in indices:
-                        start = idx * head_dim
-                        end = (idx + 1) * head_dim
-                        if dim == 0:
-                            slices.append(w[start:end])
-                        else:
-                            slices.append(w[:, start:end])
-                    
-                    if dim == 0:
-                        target.data.copy_(torch.cat(slices, dim=0))
-                    else:
-                        target.data.copy_(torch.cat(slices, dim=1))
-
             load_split_heads(block.att.W_query.weight, f"{prefix}self_attn.q_proj.weight", 0, self.config.n_heads, self.config.head_dim)
             load_split_heads(block.att.W_query.bias, f"{prefix}self_attn.q_proj.bias", 0, self.config.n_heads, self.config.head_dim)
             load_split_heads(block.att.W_key.weight, f"{prefix}self_attn.k_proj.weight", 0, self.config.n_kv_groups, self.config.head_dim, indices=block.att.kv_head_indices)
@@ -570,22 +584,40 @@ class StaticDistributedQwen3Model(nn.Module):
             load_split(block.ff.fc2.weight, f"{prefix}mlp.up_proj.weight", 0)
             load_split(block.ff.fc3.weight, f"{prefix}mlp.down_proj.weight", 1)
             
-            block.norm1.scale.data.copy_(state_dict[f"{prefix}input_layernorm.weight"])
-            block.norm2.scale.data.copy_(state_dict[f"{prefix}post_attention_layernorm.weight"])
+            w = get_tensor(f"{prefix}input_layernorm.weight")
+            block.norm1.scale.data.copy_(w)
+            del w
+            gc.collect()
+            
+            w = get_tensor(f"{prefix}post_attention_layernorm.weight")
+            block.norm2.scale.data.copy_(w)
+            del w
+            gc.collect()
 
         if self.my_stage_idx == 0:
-            self.tok_emb.weight.data.copy_(state_dict["model.embed_tokens.weight"])
+            w = get_tensor("model.embed_tokens.weight")
+            self.tok_emb.weight.data.copy_(w)
+            del w
+            gc.collect()
             
         for i, layer in enumerate(self.layers):
             load_layer_weights(self.start_layer + i, layer)
             
         if self.my_stage_idx == len(self.stage_ranks) - 1:
-            self.final_norm.scale.data.copy_(state_dict["model.norm.weight"])
-            # Load full output head weights (no splitting)
-            if "lm_head.weight" in state_dict:
-                self.out_head.weight.data.copy_(state_dict["lm_head.weight"])
-            else:
-                self.out_head.weight.data.copy_(state_dict["model.embed_tokens.weight"])
+            w = get_tensor("model.norm.weight")
+            self.final_norm.scale.data.copy_(w)
+            del w
+            gc.collect()
+            
+            with safe_open(model_path, framework="pt", device="cpu") as f:
+                if "lm_head.weight" in f.keys():
+                    w = get_tensor("lm_head.weight")
+                else:
+                    w = get_tensor("model.embed_tokens.weight")
+            self.out_head.weight.data.copy_(w)
+            del w
+            gc.collect()
+            
         logger.info(f"[Rank {self.my_rank}] Weights loaded.")
 
     def forward(self, x, start_pos=0, task_id=0):
