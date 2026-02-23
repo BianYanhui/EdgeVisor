@@ -513,8 +513,22 @@ class OptimizedDistributedQwen3Model(nn.Module):
         # Stage 0: Embeddings
         if self.my_stage_idx == 0:
             if self.tp_world_size > 1:
-                 # Broadcast input_ids if needed (usually assumed consistent)
-                 pass
+                # Broadcast input_ids from TP rank 0 to others in Stage 0
+                if self.tp_rank == 0:
+                    shape = torch.tensor(x.shape, dtype=torch.long)
+                else:
+                    shape = torch.zeros(2, dtype=torch.long)
+                
+                # Broadcast shape first
+                dist.broadcast(shape, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
+                
+                # Prepare buffer for receivers
+                if self.tp_rank != 0:
+                    x = torch.zeros(tuple(shape.tolist()), dtype=torch.long)
+                
+                # Broadcast data
+                dist.broadcast(x, src=self.stage_ranks[self.my_stage_idx][0], group=self.tp_group)
+
             t0 = time.perf_counter()
             x = self.tok_embeddings(x)
             self.profiler.record_compute(time.perf_counter() - t0)
