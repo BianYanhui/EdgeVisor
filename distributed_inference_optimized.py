@@ -697,6 +697,7 @@ def main():
     parser.add_argument("--ips", type=str)
     parser.add_argument("--model", type=str)
     parser.add_argument("--tokenizer", type=str)
+    parser.add_argument("--num_tasks", type=int, default=1, help="Number of concurrent tasks (<= 5)")
     parser.add_argument("--test_local", action="store_true")
     parser.add_argument("--test_4", action="store_true")
     args = parser.parse_args()
@@ -734,7 +735,8 @@ def main():
                     "model_path": args.model,
                     "master_addr": alloc["global_root_ip"].split(':')[0],
                     "master_port": 29501,
-                    "world_size": len(all_devices)
+                    "world_size": len(all_devices),
+                    "num_tasks": args.num_tasks
                 }
                 if global_rank == 0: my_config = node_config
                 else: send_config_to_node(device_ip, args.port, node_config)
@@ -761,11 +763,19 @@ def main():
     tokenizer = None
     
     # Define prompts for multi-task pipeline testing
-    prompts = [
+    all_prompts = [
         "The capital of France is",
         "Artificial Intelligence will", 
-        "Python is popular because"
+        "Python is popular because",
+        "The future of space exploration",
+        "Deep learning transforms"
     ]
+    # Limit to 5 tasks as requested
+    # Use config from rank 0 if available, otherwise default to args or 1
+    num_tasks = my_config.get('num_tasks', args.num_tasks)
+    num_tasks = min(num_tasks, 5)
+    if num_tasks < 1: num_tasks = 1
+    prompts = all_prompts[:num_tasks]
     
     if my_config['my_rank'] == 0:
         if args.tokenizer:
