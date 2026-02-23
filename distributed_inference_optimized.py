@@ -743,11 +743,31 @@ def main():
     
     if my_config['my_rank'] == 0:
         if args.tokenizer:
+            # Try loading HuggingFace tokenizer
             try:
-                tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+                tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
             except Exception as e:
-                logger.error(f"Failed to load tokenizer: {e}")
-                tokenizer = None
+                logger.error(f"Failed to load HF tokenizer: {e}")
+                
+                # Fallback: Try raw tiktoken if available
+                try:
+                    import tiktoken
+                    logger.info("Falling back to raw tiktoken (cl100k_base)...")
+                    class TiktokenWrapper:
+                        def __init__(self):
+                            self.enc = tiktoken.get_encoding("cl100k_base")
+                        def encode(self, text, return_tensors=None):
+                            ids = self.enc.encode(text)
+                            if return_tensors == "pt":
+                                return torch.tensor([ids], dtype=torch.long)
+                            return ids
+                        def decode(self, ids):
+                            if isinstance(ids, torch.Tensor): ids = ids.tolist()
+                            return self.enc.decode(ids)
+                    tokenizer = TiktokenWrapper()
+                except ImportError:
+                    logger.error("Tiktoken not found either. Using Dummy.")
+                    tokenizer = None
         
         prompt_list = ["Hello"] # Default
         if tokenizer:
