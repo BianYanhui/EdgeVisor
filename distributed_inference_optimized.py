@@ -4,9 +4,25 @@ import sys
 
 # --- Fix for Jetson .local path ---
 # Ensure local site-packages are included, especially for tiktoken/transformers
-local_site_packages = os.path.expanduser("~/.local/lib/python3.10/site-packages")
+import site
+user_site = site.getusersitepackages()
+if os.path.exists(user_site) and user_site not in sys.path:
+    sys.path.insert(0, user_site)
+
+# Fallback for specific Python versions if site.getusersitepackages() is weird
+local_site_packages = os.path.expanduser(f"~/.local/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages")
 if os.path.exists(local_site_packages) and local_site_packages not in sys.path:
     sys.path.insert(0, local_site_packages)
+
+# Debug: Check imports
+try:
+    import tiktoken
+    import sentencepiece
+    # logger is not defined yet, use print
+    # print(f"DEBUG: tiktoken found at {tiktoken.__file__}")
+except ImportError as e:
+    print(f"DEBUG: Import failed even after path fix: {e}")
+    print(f"DEBUG: sys.path: {sys.path}")
 # ----------------------------------
 
 import json
