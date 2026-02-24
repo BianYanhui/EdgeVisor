@@ -1623,32 +1623,43 @@ def main():
     
     if my_config['my_rank'] == 0:
         if args.tokenizer:
-            # Check if .t file (Custom) -> Use Fallback immediately
+            # Check if .t file (Custom)
             if args.tokenizer.endswith('.t'):
-                 logger.info(f"Custom tokenizer file detected: {args.tokenizer}. Using Tiktoken fallback.")
+                 logger.info(f"Custom tokenizer file detected: {args.tokenizer}")
+                 tokenizer = None
+                 # 1. Try loading as a standard format (renamed)
                  try:
-                    import tiktoken
-                    class TiktokenWrapper:
-                        def __init__(self):
-                            self.enc = tiktoken.get_encoding("cl100k_base")
-                        def encode(self, text, return_tensors=None):
-                            ids = self.enc.encode(text)
-                            if return_tensors == "pt":
-                                return torch.tensor([ids], dtype=torch.long)
-                            return ids
-                        def decode(self, ids):
-                            if isinstance(ids, torch.Tensor): ids = ids.tolist()
-                            valid_ids = []
-                            for i in ids:
-                                try:
-                                    self.enc.decode([i])
-                                    valid_ids.append(i)
-                                except Exception: pass
-                            return self.enc.decode(valid_ids)
-                    tokenizer = TiktokenWrapper()
-                 except ImportError:
-                    logger.error("Tiktoken not found. Cannot load custom tokenizer.")
-                    tokenizer = None
+                     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+                     logger.info("Successfully loaded .t file using AutoTokenizer.")
+                 except Exception as e:
+                     logger.warning(f"Could not load .t file with AutoTokenizer: {e}")
+                 
+                 # 2. Fallback to Tiktoken if failed
+                 if tokenizer is None:
+                     logger.info("Using Tiktoken fallback for .t file.")
+                     try:
+                        import tiktoken
+                        class TiktokenWrapper:
+                            def __init__(self):
+                                self.enc = tiktoken.get_encoding("cl100k_base")
+                            def encode(self, text, return_tensors=None):
+                                ids = self.enc.encode(text)
+                                if return_tensors == "pt":
+                                    return torch.tensor([ids], dtype=torch.long)
+                                return ids
+                            def decode(self, ids):
+                                if isinstance(ids, torch.Tensor): ids = ids.tolist()
+                                valid_ids = []
+                                for i in ids:
+                                    try:
+                                        self.enc.decode([i])
+                                        valid_ids.append(i)
+                                    except Exception: pass
+                                return self.enc.decode(valid_ids)
+                        tokenizer = TiktokenWrapper()
+                     except ImportError:
+                        logger.error("Tiktoken not found. Cannot load custom tokenizer.")
+                        tokenizer = None
             else:
                 # Try loading HuggingFace tokenizer
                 try:

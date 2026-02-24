@@ -43,27 +43,30 @@ REMOTE_FILE = f'{REMOTE_DIR}/{LOCAL_FILE}'
 # Rank 4: 12
 # Rank 5: 13
 
-# Balanced Plan for 32 Layers (Optimized for Stability):
-# CC nodes (Rank 1,2,3) crash when loading weights (likely OOM or mmap issue).
-# Strategy: Assign 0 layers to CC nodes. They act as pass-through routers.
-# Jetsons (Rank 0,4,5) take all layers.
-# Rank 0 (Jetson): 11 layers (Embeddings)
-# Rank 1 (CC): 0 layers
-# Rank 2 (CC): 0 layers
-# Rank 3 (CC): 0 layers
-# Rank 4 (Jetson): 11 layers
-# Rank 5 (Jetson): 10 layers (Head)
-# Total: 11+0+0+0+11+10 = 32.
+# Stable Multi-Device Config:
+# Jetsons (Rank 0, 1, 2) are fast.
+# CCs (Rank 3, 4, 5) are slow.
+# User Request: '1:1@26*31:1@9*1:1@1' (Total 36 Layers)
+# We map IPs to satisfy the ratios:
+# Stage 0 (1:1@26): Needs 2 devices. Use Jetson + Jetson. (Strong/Strong)
+# Stage 1 (31:1@9): Needs 2 devices. Use Jetson + CC. (Strong/Weak ratio 31:1)
+# Stage 2 (1:1@1): Needs 2 devices. Use CC + CC. (Weak/Weak)
 
-# IP Order: 16(J), 11(C), 12(C), 13(C), 15(J), 17(J)
+# IP Order:
+# 1. 192.168.182.16 (Jetson) -> Stage 0, Dev 1
+# 2. 192.168.182.17 (Jetson) -> Stage 0, Dev 2
+# 3. 192.168.182.15 (Jetson) -> Stage 1, Dev 1 (Ratio 31)
+# 4. 192.168.182.11 (CC)     -> Stage 1, Dev 2 (Ratio 1)
+# 5. 192.168.182.12 (CC)     -> Stage 2, Dev 1
+# 6. 192.168.182.13 (CC)     -> Stage 2, Dev 2
 
 MASTER_ARGS = (
     "distributed_inference_optimized.py "
     "--mode assign "
     "--my_ip 192.168.182.16 "
     "--port 29500 "
-    "--config '1@11*1@0*1@0*1@0*1@11*1@10' "
-    "--ips '192.168.182.16:29500,192.168.182.11:29500,192.168.182.12:29500,192.168.182.13:29500,192.168.182.15:29500,192.168.182.17:29500' "
+    "--config '1:1@26*31:1@9*1:1@1' "
+    "--ips '192.168.182.16:29500,192.168.182.17:29500,192.168.182.15:29500,192.168.182.11:29500,192.168.182.12:29500,192.168.182.13:29500' "
     "--model /home/models/dllama_model_qwen3_8b_q40.m "
     "--tokenizer /home/models/dllama_tokenizer_qwen3_8b_q40.t "
     "--num_tasks 3"
