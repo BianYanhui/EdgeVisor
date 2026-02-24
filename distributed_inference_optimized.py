@@ -279,6 +279,34 @@ class CommManager:
         timestamp = self.meta_buffer[5].item()
         return (b, s, d), start_pos, task_id, timestamp
 
+def read_m_file_config(model_path):
+    if not model_path or not model_path.endswith('.m'): return {}
+    try:
+        with open(model_path, 'rb') as f:
+            header_bytes = f.read(136)
+            config_dict = {}
+            # Keys: 2: dim, 1: hidden?, 3: n_heads, 4: n_kv, 5: n_layers, 9: vocab
+            import struct
+            for i in range(8, 136, 8):
+                key, val = struct.unpack('<II', header_bytes[i:i+8])
+                config_dict[key] = val
+            
+            cfg = {}
+            if 2 in config_dict: cfg['dim'] = config_dict[2]
+            if 1 in config_dict: cfg['hidden_dim'] = config_dict[1]
+            if 3 in config_dict: cfg['n_heads'] = config_dict[3]
+            if 4 in config_dict: cfg['n_kv_heads'] = config_dict[4]
+            if 5 in config_dict: cfg['n_layers'] = config_dict[5]
+            if 9 in config_dict: cfg['vocab_size'] = config_dict[9]
+            if 2 in config_dict and 3 in config_dict:
+                cfg['head_dim'] = config_dict[2] // config_dict[3]
+            
+            print(f"[Config] Auto-detected config from .m file: {cfg}")
+            return cfg
+    except Exception as e:
+        print(f"[Config] Failed to read .m config: {e}")
+        return {}
+
 # --- Model Components ---
 
 class RMSNorm(nn.Module):
@@ -677,7 +705,7 @@ class OptimizedDistributedQwen3Model(nn.Module):
                     offset += remaining
                 else:
                     # Read raw bytes
-                    raw_bytes = torch.frombuffer(mm[offset : offset + total_bytes], dtype=torch.uint8)
+                    raw_bytes = torch.frombuffer(mm[offset : offset + total_bytes], dtype=torch.uint8).clone()
                     offset += total_bytes
                     
                     # Unpack Q4_0
@@ -1334,6 +1362,14 @@ def main():
             if my_config['my_rank'] in ranks: tp_group = g
 
     model_config = ModelConfig() # Default config
+    
+    # Auto-detect config from model file if available
+    detected_cfg = read_m_file_config(my_config.get('model_path'))
+    if detected_cfg:
+        for k, v in detected_cfg.items():
+            if hasattr(model_config, k):
+                setattr(model_config, k, v)
+                
     model_config.disable_tp = my_config.get('disable_tp', False)
     if model_config.disable_tp and my_config['my_rank'] == 0:
         logger.warning("TP All-Reduce is DISABLED for performance testing! Results may be incorrect.")
