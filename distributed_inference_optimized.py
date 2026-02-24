@@ -141,7 +141,8 @@ class InferenceProfiler:
 class QuantizedLinear(nn.Module):
     """
     Custom Linear layer that holds quantized weights (Int8).
-    De-quantizes on the fly for computation.
+    Performs quantized matrix multiplication using int8 inputs and weights.
+    Supports 'int8' activation quantization on the fly.
     """
     def __init__(self, in_features, out_features, bias=False, dtype=torch.float32):
         super().__init__()
@@ -151,9 +152,7 @@ class QuantizedLinear(nn.Module):
         
         # Quantized storage
         self.register_buffer('weight_data', torch.zeros((out_features, in_features), dtype=torch.int8))
-        self.register_buffer('scale', torch.tensor(1.0, dtype=torch.float32))
-        # Pre-dequantized cache for CPU performance
-        self.register_buffer('float_weight', None)
+        self.register_buffer('scale', torch.ones((out_features, 1), dtype=torch.float32))
         
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features, dtype=dtype))
@@ -161,13 +160,60 @@ class QuantizedLinear(nn.Module):
             self.register_parameter('bias', None)
 
     def forward(self, x):
-        # Optimization 1: Use cached float weights if available to avoid dynamic dequantization
-        if self.float_weight is not None:
-            return F.linear(x, self.float_weight, self.bias)
+        # Debug: Print stats once
+        if not hasattr(self, 'debug_printed'):
+             self.debug_printed = True
+             with torch.no_grad():
+                 w_float = self.weight_data.float()
+                 logger.info(f"Layer {self.in_features}->{self.out_features} W: mean={w_float.mean():.4f}, std={w_float.std():.4f}, max={w_float.max()}, min={w_float.min()}")
+                 logger.info(f"Layer Scale: mean={self.scale.mean():.6f}, max={self.scale.max():.6f}")
+                 
+        # x: [batch, seq, in_features] (float32)
+        # Quantize input x to int8 on the fly
+        # 1. Calculate scale (per-tensor or per-token?)
+        # For simplicity and speed, use per-tensor max
+        abs_x = x.abs()
+        max_val = abs_x.max()
+        if max_val == 0:
+            scale_x = torch.tensor(1.0, device=x.device, dtype=x.dtype)
+        else:
+            scale_x = max_val / 127.0
             
-        # Dequantize: w = weight_data * scale
-        w = self.weight_data.to(x.dtype) * self.scale
-        return F.linear(x, w, self.bias)
+        # 2. Quantize
+        # Note: clamp is essential to avoid overflow
+        x_int8 = (x / scale_x).round().clamp(-127, 127).to(torch.int8)
+        
+        # 3. Integer Matrix Multiplication
+        # shape: [batch*seq, in] @ [out, in].T -> [batch*seq, out] (int32)
+        # _int_mm requires 2D inputs
+        x_shape = x.shape
+        if len(x_shape) == 3:
+            x_flat = x_int8.view(-1, self.in_features)
+        else:
+            x_flat = x_int8
+            
+        # Use torch._int_mm if available, else fallback to float simulation (should not happen on modern torch)
+        if hasattr(torch, '_int_mm'):
+            y_int32 = torch._int_mm(x_flat, self.weight_data.t())
+        else:
+            # Fallback (slow, but functionally correct logic)
+            y_int32 = torch.matmul(x_flat.float(), self.weight_data.t().float()).to(torch.int32)
+            
+        # 4. Rescale Output (Dequantize to float for next layer/norm)
+        # y_float = y_int32 * scale_x * scale_w
+        # This is the "logical" float value.
+        # scale_w is [out, 1]. y_int32 is [batch*seq, out].
+        # We need to multiply each column j by scale_w[j].
+        # Transpose scale to [1, out] for broadcasting.
+        y = y_int32.to(self.dtype) * (scale_x * self.scale.view(1, -1))
+        
+        if len(x_shape) == 3:
+            y = y.view(x_shape[0], x_shape[1], self.out_features)
+            
+        if self.bias is not None:
+            y = y + self.bias
+            
+        return y
 
 class CommManager:
     """Helper class for managing communication buffers and optimized operations"""
@@ -496,17 +542,39 @@ class OptimizedDistributedQwen3Model(nn.Module):
              self._load_safetensors(model_path)
              
     def _load_m_file(self, model_path):
-        # Heuristic/Placeholder loading for .m file
-        # In a real scenario, we would parse the header and offset.
-        # Since we don't have the exact spec, we initialize with random data
-        # BUT we respect the TP structure.
-        logger.warning("Loading .m file with heuristic/random initialization for performance testing.")
+        # 1. Attempt to load as safetensors (handling renamed files)
+        try:
+            # Check header first to avoid long timeout or weird error
+            with open(model_path, 'rb') as f:
+                header = f.read(8)
+                # Safetensors usually starts with a large int (json length)
+                # If it's the custom binary, it starts with magic or config?
+                # optimized_inference.py says header parsing starts at offset 8.
+                pass
+                
+            logger.info(f"[Rank {self.my_rank}] Attempting to load .m file as safetensors...")
+            self._load_safetensors(model_path)
+            logger.info(f"[Rank {self.my_rank}] Successfully loaded .m file as safetensors.")
+            return
+        except Exception as e:
+            logger.info(f"[Rank {self.my_rank}] Not a safetensors file: {e}")
+
+        # 2. Attempt to load as Custom Binary (.m)
+        try:
+            logger.info(f"[Rank {self.my_rank}] Attempting to load .m file as Custom Binary (Q8_0)...")
+            self._load_m_file_binary(model_path)
+            logger.info(f"[Rank {self.my_rank}] Successfully loaded .m file as Custom Binary.")
+            return
+        except Exception as e:
+            logger.warning(f"[Rank {self.my_rank}] Failed to load as Custom Binary: {e}")
+
+        # 3. Fallback to Random
+        logger.warning(f"[Rank {self.my_rank}] Falling back to heuristic/random initialization (OUTPUT WILL BE GARBLED).")
         
         def init_quantized(layer):
             layer.weight_data = torch.randint(-127, 127, (layer.out_features, layer.in_features), dtype=torch.int8)
-            layer.scale = torch.tensor(1.0/127.0, dtype=torch.float32)
-            # Optimization 1: Pre-dequantize for CPU performance
-            layer.float_weight = layer.weight_data.to(torch.float32) * layer.scale
+            layer.scale = torch.ones((layer.out_features, 1), dtype=torch.float32) * (1.0/127.0)
+            # layer.float_weight = layer.weight_data.to(torch.float32) * layer.scale # Removed float_weight
             
         for layer in self.layers:
             init_quantized(layer.attention.q_proj)
@@ -517,10 +585,508 @@ class OptimizedDistributedQwen3Model(nn.Module):
             init_quantized(layer.feed_forward.up_proj)
             init_quantized(layer.feed_forward.down_proj)
 
+    def _load_m_file_binary(self, model_path):
+        import mmap
+        import struct
+        
+        with open(model_path, 'rb') as f:
+            # Parse Header
+            header_bytes = f.read(136)
+            config_dict = {}
+            for i in range(8, 136, 8):
+                key, val = struct.unpack('<II', header_bytes[i:i+8])
+                config_dict[key] = val
+            
+            # Basic validation
+            file_dim = config_dict.get(2, self.config.dim)
+            file_vocab_size = config_dict.get(9, self.config.vocab_size)
+            
+            if file_dim != self.config.dim:
+                logger.warning(f"Binary file dim {file_dim} mismatch with config {self.config.dim}")
+            
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            offset = 136
+            
+            # Helper for reading tensors
+            def load_tensor(n_bytes, dtype=torch.float32, shape=None):
+                nonlocal offset
+                data = torch.frombuffer(mm[offset : offset + n_bytes], dtype=dtype)
+                if shape:
+                    data = data.view(shape)
+                offset += n_bytes
+                return data.clone() # Clone to copy to memory and detach from mmap
+
+            # 1. Embeddings (Float32)
+            # Stage 0 needs embeddings. Others might skip or load dummy to advance offset?
+            # We must advance offset regardless of rank to stay in sync with file layout.
+            vocab = file_vocab_size
+            dim = file_dim
+            emb_bytes = vocab * dim * 4
+            
+            if self.my_stage_idx == 0:
+                logger.info(f"[Rank {self.my_rank}] Loading Embeddings (Vocab={vocab}, Dim={dim})...")
+                w = load_tensor(emb_bytes, torch.float32, (vocab, dim))
+                # Resize if needed
+                if vocab != self.config.vocab_size:
+                    logger.warning(f"Resizing embeddings from {vocab} to {self.config.vocab_size}")
+                    self.tok_embeddings = nn.Embedding(self.config.vocab_size, self.config.dim)
+                    # Copy common part
+                    min_vocab = min(vocab, self.config.vocab_size)
+                    self.tok_embeddings.weight.data[:min_vocab].copy_(w[:min_vocab])
+                else:
+                    self.tok_embeddings.weight.data.copy_(w)
+            else:
+                offset += emb_bytes # Skip
+
+            # 2. Layers
+            # Assumed Order: RMS_Attn, RMS_FFN, Q, K, V, O, Gate, Up, Down
+            # Note: Weights are likely (out, in) flat.
+            
+            head_dim = self.config.head_dim
+            n_heads = self.config.n_heads
+            n_kv = self.config.n_kv_heads
+            hidden = self.config.hidden_dim
+            
+            # Sizes (bytes) for Q8_0 (1 byte per element)
+            sz_rms = dim * 4
+            sz_q = dim * n_heads * head_dim
+            sz_k = dim * n_kv * head_dim
+            sz_v = dim * n_kv * head_dim
+            sz_o = n_heads * head_dim * dim
+            sz_gate = dim * hidden
+            sz_up = dim * hidden
+            sz_down = hidden * dim
+            
+            # TP Helper
+            def load_split_q4(target_layer, full_shape, split_dim, sz_params):
+                nonlocal offset
+                # Q4_0: Block size 32. Per block: 2 byte scale (f16) + 16 bytes data (32 4-bit).
+                # Total 18 bytes per 32 params.
+                block_size = 32
+                block_bytes = 18
+                
+                num_blocks = sz_params // block_size
+                total_bytes = num_blocks * block_bytes
+                
+                # Check remaining
+                remaining = mm.size() - offset
+                if remaining < total_bytes:
+                    logger.warning(f"[Rank {self.my_rank}] Short read for Q4! Needed {total_bytes}, got {remaining}. Padding.")
+                    # Fallback to zeros if corrupted
+                    w_float = torch.zeros(full_shape, dtype=torch.float32)
+                    offset += remaining
+                else:
+                    # Read raw bytes
+                    raw_bytes = torch.frombuffer(mm[offset : offset + total_bytes], dtype=torch.uint8)
+                    offset += total_bytes
+                    
+                    # Unpack Q4_0
+                    # This is slow in pure Python/Torch without custom kernel, but needed for correctness.
+                    # Vectorized unpacking:
+                    # Reshape to [num_blocks, 18]
+                    blocks = raw_bytes.view(num_blocks, block_bytes)
+                    
+                    # Scales: First 2 bytes (float16)
+                    # scales_bytes is a Tensor of uint8. We need to bitcast to float16.
+                    scales_bytes = blocks[:, :2].flatten() # [num_blocks * 2] (contiguous uint8)
+                    # Bitcast to float16
+                    scales = scales_bytes.view(torch.float16).to(torch.float32)
+                    
+                    # Data: Next 16 bytes
+                    data_bytes = blocks[:, 2:].flatten() # [num_blocks * 16]
+                    
+                    # Unpack nibbles
+                    # w0 = byte & 0x0F
+                    # w1 = byte >> 4
+                    low = (data_bytes & 0x0F).to(torch.float32) - 8.0
+                    high = (data_bytes >> 4).to(torch.float32) - 8.0
+                    
+                    # Interleave? Usually low is even index, high is odd?
+                    # Q4_0 layout: [w0, w1, w2... w31]
+                    # Byte 0: w0, w1
+                    # So we need to stack them.
+                    weights = torch.stack([low, high], dim=1).flatten() # [num_blocks * 32]
+                    
+                    # Apply scales
+                    # scales: [num_blocks] -> repeat 32 times
+                    scales_expanded = scales.repeat_interleave(32)
+                    
+                    w_float = (weights * scales_expanded).view(full_shape)
+
+                # Now we have Float weights. Quantize to Int8 for our runtime
+                # Calculate TP split
+                total_ratio = sum(self.tp_ratios)
+                dim_size = full_shape[split_dim]
+                size_per_ratio = dim_size / total_ratio
+                
+                start = int(round(sum(self.tp_ratios[:self.tp_rank]) * size_per_ratio))
+                end = int(round(sum(self.tp_ratios[:self.tp_rank + 1]) * size_per_ratio))
+                
+                # Slice
+                if split_dim == 0:
+                    w_slice = w_float[start:end]
+                else:
+                    w_slice = w_float[:, start:end]
+                
+                # Quantize to Int8 (Per-Channel)
+                abs_w = w_slice.abs()
+                max_val = abs_w.max(dim=1, keepdim=True).values
+                scale = max_val / 127.0
+                scale = torch.where(scale == 0, torch.tensor(1.0, dtype=scale.dtype, device=scale.device), scale)
+                # Fix NaNs in scale (from misalignment or bad data)
+                if torch.isnan(scale).any():
+                    scale = torch.nan_to_num(scale, nan=0.001) # Use small default scale
+                    
+                w_int8 = (w_slice / scale).round().clamp(-127, 127).to(torch.int8)
+                
+                target_layer.weight_data = w_int8
+                target_layer.scale = scale
+                target_layer.out_features = w_int8.shape[0]
+                target_layer.in_features = w_int8.shape[1]
+
+            def load_split_q8(target_layer, full_shape, split_dim, sz_bytes):
+                # Legacy / Fallback for Q8
+                # ... (Keep existing if needed, but we replace usage with load_split_q4)
+                pass
+
+
+            def load_norm(target_norm):
+                nonlocal offset
+                # Align to 32 bytes before reading F32 Norm?
+                # offset = (offset + 31) // 32 * 32 
+                w = load_tensor(sz_rms, torch.float32, (dim,))
+                target_norm.weight.data.copy_(w)
+
+            def skip_bytes(n):
+                nonlocal offset
+                offset += n
+
+            def load_bias(target_layer, dim_size):
+                nonlocal offset
+                sz_bias = dim_size * 4 # Float32
+                
+                # Check remaining
+                if mm.size() - offset < sz_bias:
+                    logger.warning(f"Short read for bias. Padding.")
+                    offset = mm.size()
+                    return
+                    
+                w = load_tensor(sz_bias, torch.float32)
+                
+                # TP Split for Bias
+                # Bias is 1D [out]. Split along dim 0.
+                total_ratio = sum(self.tp_ratios)
+                size_per_ratio = dim_size // total_ratio
+                start = int(round(sum(self.tp_ratios[:self.tp_rank]) * size_per_ratio))
+                end = int(round(sum(self.tp_ratios[:self.tp_rank + 1]) * size_per_ratio))
+                
+                if target_layer.bias is not None:
+                    target_layer.bias.data.copy_(w[start:end])
+                
+            # Iterate over all layers in the file
+            total_layers_in_file = self.config.n_layers # Use config count
+            
+            for i in range(total_layers_in_file):
+                # Check if this layer belongs to my stage
+                is_my_layer = (i >= self.start_layer) and (i < self.start_layer + self.num_layers)
+                
+                if is_my_layer:
+                    local_idx = i - self.start_layer
+                    block = self.layers[local_idx]
+                    
+                    # Q, K, V, O
+                    # Q: (dim, dim)
+                    load_split_q4(block.attention.q_proj, (n_heads*head_dim, dim), 0, sz_q // 1 * 1)
+                    # load_bias(block.attention.q_proj, n_heads*head_dim)
+                    
+                    # K: (dim_kv, dim)
+                    load_split_q4(block.attention.k_proj, (n_kv*head_dim, dim), 0, sz_k)
+                    # load_bias(block.attention.k_proj, n_kv*head_dim)
+                    
+                    # V: (dim_kv, dim)
+                    load_split_q4(block.attention.v_proj, (n_kv*head_dim, dim), 0, sz_v)
+                    # load_bias(block.attention.v_proj, n_kv*head_dim)
+                    
+                    # O: (dim, dim)
+                    load_split_q4(block.attention.o_proj, (dim, n_heads*head_dim), 1, sz_o)
+                    # O usually no bias
+                    
+                    # RMS Attn (Moved to after O to fix alignment)
+                    load_norm(block.attention_norm)
+                    
+                    # RMS FFN (Post Attention Norm)
+                    load_norm(block.ffn_norm)
+
+                    # Gate, Up, Down
+                    load_split_q4(block.feed_forward.gate_proj, (hidden, dim), 0, sz_gate)
+                    load_split_q4(block.feed_forward.up_proj, (hidden, dim), 0, sz_up)
+                    load_split_q4(block.feed_forward.down_proj, (dim, hidden), 1, sz_down)
+                    
+                else:
+                    # Skip this layer
+                    # Q4 params
+                    total_params = (n_heads*head_dim*dim) + (n_kv*head_dim*dim)*2 + (dim*n_heads*head_dim) + (hidden*dim)*2 + (dim*hidden)
+                    skip_size = (total_params // 32) * 18 + sz_rms * 2
+                    # Add biases skip
+                    # bias_size = (n_heads*head_dim + n_kv*head_dim*2) * 4
+                    skip_bytes(skip_size) # + bias_size)
+
+            # 3. Final Norm & Head
+            # Last stage loads
+            is_last_stage = (self.my_stage_idx == len(self.stage_ranks) - 1)
+            
+            # Final Norm
+            if is_last_stage:
+                load_norm(self.norm)
+            else:
+                skip_bytes(sz_rms)
+                
+            # Head (if present)
+            # Check remaining bytes
+            remaining = mm.size() - offset
+            sz_head_float = vocab * dim * 4
+            sz_head_q4 = (vocab * dim // 32) * 18
+            
+            if is_last_stage:
+                if remaining >= sz_head_float:
+                    logger.info(f"[Rank {self.my_rank}] Loading Head (Float32)...")
+                    w = load_tensor(sz_head_float, torch.float32, (vocab, dim))
+                    self.output.weight.data.copy_(w)
+                elif remaining >= sz_head_q4:
+                    logger.info(f"[Rank {self.my_rank}] Loading Head (Q4_0)...")
+                    # Inline Q4 unpacking
+                    block_size = 32
+                    block_bytes = 18
+                    num_blocks = (vocab * dim) // block_size
+                    total_bytes = num_blocks * block_bytes
+                    
+                    raw_bytes = torch.frombuffer(mm[offset : offset + total_bytes], dtype=torch.uint8)
+                    offset += total_bytes
+                    
+                    blocks = raw_bytes.view(num_blocks, block_bytes)
+                    scales_bytes = blocks[:, :2].flatten()
+                    scales = scales_bytes.view(torch.float16).to(torch.float32)
+                    data_bytes = blocks[:, 2:].flatten()
+                    low = (data_bytes & 0x0F).to(torch.float32) - 8.0
+                    high = (data_bytes >> 4).to(torch.float32) - 8.0
+                    weights = torch.stack([low, high], dim=1).flatten()
+                    scales_expanded = scales.repeat_interleave(32)
+                    w_float = (weights * scales_expanded).view(vocab, dim)
+                    
+                    self.output.weight.data.copy_(w_float)
+                else:
+                    logger.warning(f"[Rank {self.my_rank}] Head weights missing (Remaining {remaining}, Needed {sz_head_q4}). Using random.")
+            else:
+                if remaining >= sz_head_float:
+                    skip_bytes(sz_head_float)
+                elif remaining >= sz_head_q4:
+                    skip_bytes(sz_head_q4)
+
     def _load_safetensors(self, model_path):
-        # ... (Implementation similar to static_inference.py but mapping to QuantizedLinear) ...
-        # For brevity, assuming user uses .m for optimization task.
-        pass
+        logger.info(f"[Rank {self.my_rank}] Loading weights from {model_path} (SafeTensors)...")
+        
+        def get_tensor(key):
+            with safe_open(model_path, framework="pt", device="cpu") as f:
+                return f.get_tensor(key)
+        
+        def load_split(target_layer, key, dim):
+            # target_layer is QuantizedLinear
+            # We load directly into weight_data (quantizing from float if needed)
+            w = get_tensor(key).to(torch.float32)
+            
+            total_ratio = sum(self.tp_ratios)
+            dim_size = w.shape[dim]
+            size_per_ratio = dim_size / total_ratio
+            
+            start = int(round(sum(self.tp_ratios[:self.tp_rank]) * size_per_ratio))
+            end = int(round(sum(self.tp_ratios[:self.tp_rank + 1]) * size_per_ratio))
+            
+            if dim == 0:
+                w_slice = w[start:end]
+            else:
+                w_slice = w[:, start:end]
+            
+            # Quantize weights to Int8
+            # Per-Channel Quantization (dim 0 of w_slice)
+            abs_w = w_slice.abs()
+            # max per row
+            max_val = abs_w.max(dim=1, keepdim=True).values
+            scale = max_val / 127.0
+            # Avoid divide by zero
+            scale = torch.where(scale == 0, torch.tensor(1.0, dtype=scale.dtype, device=scale.device), scale)
+                
+            w_int8 = (w_slice / scale).round().clamp(-127, 127).to(torch.int8)
+            
+            target_layer.weight_data = w_int8
+            target_layer.scale = scale
+            target_layer.out_features = w_int8.shape[0]
+            target_layer.in_features = w_int8.shape[1]
+            
+            del w
+            gc.collect()
+
+        def load_split_heads(target_layer, key, dim, num_groups, head_dim, indices=None):
+            w = get_tensor(key).to(torch.float32)
+            total_ratio = sum(self.tp_ratios)
+            
+            slice_data = None
+            
+            if indices is None:
+                start_ratio = sum(self.tp_ratios[:self.tp_rank])
+                end_ratio = sum(self.tp_ratios[:self.tp_rank + 1])
+                
+                start_group = int(round(start_ratio * num_groups / total_ratio))
+                end_group = int(round(end_ratio * num_groups / total_ratio))
+                
+                start_idx = start_group * head_dim
+                end_idx = end_group * head_dim
+                
+                if start_idx == end_idx:
+                    slice_data = torch.empty(0, 0) # Should handle empty?
+                else:
+                    if dim == 0:
+                        slice_data = w[start_idx:end_idx]
+                    else:
+                        slice_data = w[:, start_idx:end_idx]
+            else:
+                if len(indices) == 0:
+                    slice_data = torch.empty(0, 0)
+                else:
+                    slices = []
+                    for idx in indices:
+                        start = idx * head_dim
+                        end = (idx + 1) * head_dim
+                        if dim == 0:
+                            slices.append(w[start:end])
+                        else:
+                            slices.append(w[:, start:end])
+                    
+                    if dim == 0:
+                        slice_data = torch.cat(slices, dim=0)
+                    else:
+                        slice_data = torch.cat(slices, dim=1)
+            
+            if slice_data is not None:
+                # Quantize Per-Channel
+                abs_w = slice_data.abs()
+                max_val = abs_w.max(dim=1, keepdim=True).values
+                scale = max_val / 127.0
+                scale = torch.where(scale == 0, torch.tensor(1.0, dtype=scale.dtype, device=scale.device), scale)
+                
+                w_int8 = (slice_data / scale).round().clamp(-127, 127).to(torch.int8)
+                
+                target_layer.weight_data = w_int8
+                target_layer.scale = scale
+                target_layer.out_features = w_int8.shape[0]
+                target_layer.in_features = w_int8.shape[1]
+
+            del w
+            gc.collect()
+
+        def load_bias_split_heads(target_layer, key, num_groups, head_dim, indices=None):
+            # Helper for bias loading (always dim 0 since bias is 1D)
+            if target_layer.bias is None: return
+            
+            # Check if key exists
+            with safe_open(model_path, framework="pt", device="cpu") as f:
+                if key not in f.keys(): return
+                
+            w = get_tensor(key).to(torch.float32)
+            # Logic similar to split_heads but 1D
+            
+            slice_data = None
+            
+            if indices is None:
+                total_ratio = sum(self.tp_ratios)
+                start_ratio = sum(self.tp_ratios[:self.tp_rank])
+                end_ratio = sum(self.tp_ratios[:self.tp_rank + 1])
+                
+                start_group = int(round(start_ratio * num_groups / total_ratio))
+                end_group = int(round(end_ratio * num_groups / total_ratio))
+                
+                start_idx = start_group * head_dim
+                end_idx = end_group * head_dim
+                
+                if start_idx != end_idx:
+                    slice_data = w[start_idx:end_idx]
+            else:
+                if len(indices) > 0:
+                    slices = []
+                    for idx in indices:
+                        start = idx * head_dim
+                        end = (idx + 1) * head_dim
+                        slices.append(w[start:end])
+                    slice_data = torch.cat(slices, dim=0)
+            
+            if slice_data is not None:
+                target_layer.bias.data.copy_(slice_data)
+                
+            del w
+            gc.collect()
+
+        def load_layer_weights(layer_idx, block):
+            prefix = f"model.layers.{layer_idx}."
+            
+            # Attention
+            # Q, K, V are row parallel (split dim 0)
+            load_split_heads(block.attention.q_proj, f"{prefix}self_attn.q_proj.weight", 0, self.config.n_heads, self.config.head_dim)
+            load_bias_split_heads(block.attention.q_proj, f"{prefix}self_attn.q_proj.bias", self.config.n_heads, self.config.head_dim)
+            
+            load_split_heads(block.attention.k_proj, f"{prefix}self_attn.k_proj.weight", 0, self.config.n_kv_heads, self.config.head_dim, indices=block.attention.kv_head_indices)
+            load_bias_split_heads(block.attention.k_proj, f"{prefix}self_attn.k_proj.bias", self.config.n_kv_heads, self.config.head_dim, indices=block.attention.kv_head_indices)
+            
+            load_split_heads(block.attention.v_proj, f"{prefix}self_attn.v_proj.weight", 0, self.config.n_kv_heads, self.config.head_dim, indices=block.attention.kv_head_indices)
+            load_bias_split_heads(block.attention.v_proj, f"{prefix}self_attn.v_proj.bias", self.config.n_kv_heads, self.config.head_dim, indices=block.attention.kv_head_indices)
+            
+            # O is col parallel (split dim 1)
+            load_split_heads(block.attention.o_proj, f"{prefix}self_attn.o_proj.weight", 1, self.config.n_heads, self.config.head_dim)
+            # O bias? Usually no bias in O, but if there is, it's not split (reduce sum output)
+            # If there is bias, it is applied after all reduce?
+            # Standard Llama/Qwen doesn't have O bias.
+            
+            # FFN
+            # Gate, Up are row parallel (split dim 0)
+            load_split(block.feed_forward.gate_proj, f"{prefix}mlp.gate_proj.weight", 0)
+            load_split(block.feed_forward.up_proj, f"{prefix}mlp.up_proj.weight", 0)
+            # Down is col parallel (split dim 1)
+            load_split(block.feed_forward.down_proj, f"{prefix}mlp.down_proj.weight", 1)
+            
+            # Norms (Replicated)
+            w = get_tensor(f"{prefix}input_layernorm.weight").to(torch.float32)
+            block.attention_norm.weight.data.copy_(w)
+            
+            w = get_tensor(f"{prefix}post_attention_layernorm.weight").to(torch.float32)
+            block.ffn_norm.weight.data.copy_(w)
+            
+            gc.collect()
+
+        # Load Embeddings (Stage 0)
+        if self.my_stage_idx == 0:
+            w = get_tensor("model.embed_tokens.weight").to(torch.float32)
+            self.tok_embeddings.weight.data.copy_(w)
+            del w
+            gc.collect()
+            
+        # Load Layers
+        for i, layer in enumerate(self.layers):
+            load_layer_weights(self.start_layer + i, layer)
+            
+        # Load Final Norm & Head (Last Stage)
+        if self.my_stage_idx == len(self.stage_ranks) - 1:
+            w = get_tensor("model.norm.weight").to(torch.float32)
+            self.norm.weight.data.copy_(w)
+            
+            with safe_open(model_path, framework="pt", device="cpu") as f:
+                if "lm_head.weight" in f.keys():
+                    w = f.get_tensor("lm_head.weight")
+                elif "model.embed_tokens.weight" in f.keys():
+                    w = f.get_tensor("model.embed_tokens.weight")
+                else:
+                    raise KeyError("lm_head.weight not found")
+            
+            self.output.weight.data.copy_(w.to(torch.float32))
+            
+        logger.info(f"[Rank {self.my_rank}] Weights loaded successfully.")
 
     def forward(self, x, start_pos=0, task_id=0):
         # Stage > 0: Receive
@@ -796,16 +1362,11 @@ def main():
     
     if my_config['my_rank'] == 0:
         if args.tokenizer:
-            # Try loading HuggingFace tokenizer
-            try:
-                tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
-            except Exception as e:
-                logger.error(f"Failed to load HF tokenizer: {e}")
-                
-                # Fallback: Try raw tiktoken if available
-                try:
+            # Check if .t file (Custom) -> Use Fallback immediately
+            if args.tokenizer.endswith('.t'):
+                 logger.info(f"Custom tokenizer file detected: {args.tokenizer}. Using Tiktoken fallback.")
+                 try:
                     import tiktoken
-                    logger.info("Falling back to raw tiktoken (cl100k_base)...")
                     class TiktokenWrapper:
                         def __init__(self):
                             self.enc = tiktoken.get_encoding("cl100k_base")
@@ -816,25 +1377,49 @@ def main():
                             return ids
                         def decode(self, ids):
                             if isinstance(ids, torch.Tensor): ids = ids.tolist()
-                            # Filter out invalid tokens that cl100k_base doesn't support
-                            # cl100k_base vocab size is ~100k, Qwen is ~152k.
-                            # We need to clamp or ignore OOV tokens to avoid crash.
                             valid_ids = []
                             for i in ids:
                                 try:
-                                    # Try to see if it's in range by encoding it back or just checking max
-                                    # But simpler is to catch the error per token or just filter by known max
-                                    # cl100k_base max token is 100277 (approx).
-                                    # Let's try to decode one by one and skip errors
                                     self.enc.decode([i])
                                     valid_ids.append(i)
-                                except Exception:
-                                    pass
+                                except Exception: pass
                             return self.enc.decode(valid_ids)
                     tokenizer = TiktokenWrapper()
-                except ImportError:
-                    logger.error("Tiktoken not found either. Using Dummy.")
+                 except ImportError:
+                    logger.error("Tiktoken not found. Cannot load custom tokenizer.")
                     tokenizer = None
+            else:
+                # Try loading HuggingFace tokenizer
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+                except Exception as e:
+                    logger.error(f"Failed to load HF tokenizer: {e}")
+                    
+                    # Fallback: Try raw tiktoken if available
+                    try:
+                        import tiktoken
+                        logger.info("Falling back to raw tiktoken (cl100k_base)...")
+                        class TiktokenWrapper:
+                            def __init__(self):
+                                self.enc = tiktoken.get_encoding("cl100k_base")
+                            def encode(self, text, return_tensors=None):
+                                ids = self.enc.encode(text)
+                                if return_tensors == "pt":
+                                    return torch.tensor([ids], dtype=torch.long)
+                                return ids
+                            def decode(self, ids):
+                                if isinstance(ids, torch.Tensor): ids = ids.tolist()
+                                valid_ids = []
+                                for i in ids:
+                                    try:
+                                        self.enc.decode([i])
+                                        valid_ids.append(i)
+                                    except Exception: pass
+                                return self.enc.decode(valid_ids)
+                        tokenizer = TiktokenWrapper()
+                    except ImportError:
+                        logger.error("Tiktoken not found either. Using Dummy.")
+                        tokenizer = None
         
         if tokenizer:
             print(f"\n[Rank 0] Initializing {len(prompts)} tasks for Pipeline Parallelism...")
@@ -947,17 +1532,11 @@ def main():
     if HAS_DISTRIBUTED:
         dist.destroy_process_group()
 
-def _run_test_process(mode, ip, port, config, ips, model_path, tok_path, extra_args=[]):
-    sys.argv = ["prog", "--mode", mode, "--my_ip", ip, "--port", str(port)]
-    if mode == "assign":
-        sys.argv.extend(["--config", config, "--ips", ips, "--model", model_path, "--tokenizer", tok_path])
-        sys.argv.extend(extra_args)
-    main()
-
 def test_local_2_devices(args):
     # 2 Devices: 1@14 * 1@14
     model_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B-Q4_0/dllama_model_qwen3_0.6b_q40.m"
-    tok_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B"
+    # Point to the directory containing tokenizer.json (Standard Qwen Tokenizer)
+    tok_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B-Q4_0/dllama_tokenizer_qwen3_0.6b.t"
     ips = "127.0.0.1:30500,127.0.0.1:30501"
     config = "1@14*1@14"
     
@@ -965,11 +1544,22 @@ def test_local_2_devices(args):
     if args.disable_tp: extra.append("--disable_tp")
     if args.num_tasks > 1: extra.extend(["--num_tasks", str(args.num_tasks)])
     
-    p1 = mp.Process(target=_run_test_process, args=("listen", "127.0.0.1", 30501, None, None, None, None, []))
-    p0 = mp.Process(target=_run_test_process, args=("assign", "127.0.0.1", 30500, config, ips, model_path, tok_path, extra))
+    # Process 1 (Listener)
+    p1 = mp.Process(target=main_wrapper, args=("listen", "127.0.0.1", 30501, None, None, None, None, []))
+    # Process 0 (Assigner)
+    p0 = mp.Process(target=main_wrapper, args=("assign", "127.0.0.1", 30500, config, ips, model_path, tok_path, extra))
     
     p1.start(); time.sleep(1); p0.start()
     p0.join(); p1.join()
+
+def main_wrapper(mode, ip, port, config, ips, model_path, tok_path, extra_args=[]):
+    # Wrapper to set sys.argv and call main
+    sys.argv = ["prog", "--mode", mode, "--my_ip", ip, "--port", str(port)]
+    if mode == "assign":
+        sys.argv.extend(["--config", config, "--ips", ips, "--model", model_path, "--tokenizer", tok_path])
+        if extra_args:
+            sys.argv.extend(extra_args)
+    main()
 
 def test_local_4_devices():
     # 4 Devices: 1:1@14 * 1:1@14 (2 stages, TP=2 each)

@@ -520,6 +520,26 @@ class StaticDistributedQwen3Model(nn.Module):
             self.out_head = nn.Linear(config.emb_dim, config.vocab_size, bias=False, dtype=config.dtype)
 
     def load_weights(self, model_path):
+        logger.info(f"[Rank {self.my_rank}] Loading weights from {model_path}...")
+        
+        # Check if file exists
+        if not os.path.exists(model_path):
+            logger.error(f"Model file not found: {model_path}")
+            logger.warning("Initializing with RANDOM weights (File not found).")
+            self._init_random_weights()
+            return
+
+        try:
+            # Test opening to fail fast and detect format issues
+            with safe_open(model_path, framework="pt", device="cpu") as f:
+                pass
+        except Exception as e:
+            logger.error(f"Failed to open model file as safetensors: {e}")
+            logger.warning("Model file appears to be invalid or unsupported format (e.g. .m binary).")
+            logger.warning("Initializing with RANDOM weights. Inference output will be meaningless!")
+            self._init_random_weights()
+            return
+
         logger.info(f"[Rank {self.my_rank}] Loading weights with lazy loading...")
         
         def get_tensor(key):
@@ -638,6 +658,20 @@ class StaticDistributedQwen3Model(nn.Module):
             gc.collect()
             
         logger.info(f"[Rank {self.my_rank}] Weights loaded.")
+
+    def _init_random_weights(self):
+        logger.info(f"[Rank {self.my_rank}] Performing Random Initialization...")
+        for p in self.parameters():
+            if p.requires_grad:
+                nn.init.normal_(p.data, mean=0.0, std=0.02)
+        logger.info(f"[Rank {self.my_rank}] Random weights initialized.")
+
+    def _init_random_weights(self):
+        logger.info(f"[Rank {self.my_rank}] Performing Random Initialization...")
+        for p in self.parameters():
+            if p.requires_grad:
+                nn.init.normal_(p.data, mean=0.0, std=0.02)
+        logger.info(f"[Rank {self.my_rank}] Random weights initialized.")
 
     def forward(self, x, start_pos=0, task_id=0):
         # Stage > 0: Receive from Prev Stage
