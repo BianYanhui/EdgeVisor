@@ -71,6 +71,7 @@ class ModelConfig:
     norm_eps: float = 1e-6
     max_seq_len: int = 2048
     dtype: torch.dtype = torch.float32
+    disable_tp: bool = False
 
 # --- Profiler ---
 class InferenceProfiler:
@@ -151,6 +152,8 @@ class QuantizedLinear(nn.Module):
         # Quantized storage
         self.register_buffer('weight_data', torch.zeros((out_features, in_features), dtype=torch.int8))
         self.register_buffer('scale', torch.tensor(1.0, dtype=torch.float32))
+        # Pre-dequantized cache for CPU performance
+        self.register_buffer('float_weight', None)
         
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features, dtype=dtype))
@@ -158,6 +161,10 @@ class QuantizedLinear(nn.Module):
             self.register_parameter('bias', None)
 
     def forward(self, x):
+        # Optimization 1: Use cached float weights if available to avoid dynamic dequantization
+        if self.float_weight is not None:
+            return F.linear(x, self.float_weight, self.bias)
+            
         # Dequantize: w = weight_data * scale
         w = self.weight_data.to(x.dtype) * self.scale
         return F.linear(x, w, self.bias)
@@ -279,6 +286,7 @@ class FeedForward(nn.Module):
         self.tp_world_size = tp_world_size
         self.tp_group = tp_group
         self.profiler = profiler
+        self.disable_tp = cfg.disable_tp
         
         # Non-uniform splitting logic
         if tp_ratios is None: tp_ratios = [1] * tp_world_size
@@ -303,7 +311,7 @@ class FeedForward(nn.Module):
         x_intermediate = F.silu(x_gate) * x_up
         x_out = self.down_proj(x_intermediate)
         
-        if self.tp_world_size > 1:
+        if self.tp_world_size > 1 and not self.disable_tp:
             t0 = time.perf_counter()
             dist.all_reduce(x_out, op=dist.ReduceOp.SUM, group=self.tp_group)
             if self.profiler: self.profiler.record_comm(time.perf_counter() - t0)
@@ -317,6 +325,7 @@ class GroupedQueryAttention(nn.Module):
         self.tp_world_size = tp_world_size
         self.tp_group = tp_group
         self.profiler = profiler
+        self.disable_tp = cfg.disable_tp
         self.config = cfg
         self.num_heads = cfg.n_heads
         self.num_kv_heads = cfg.n_kv_heads
@@ -417,7 +426,7 @@ class GroupedQueryAttention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(b, seq_len, -1)
         out = self.o_proj(output)
         
-        if self.tp_world_size > 1:
+        if self.tp_world_size > 1 and not self.disable_tp:
             t0 = time.perf_counter()
             dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.tp_group)
             if self.profiler: self.profiler.record_comm(time.perf_counter() - t0)
@@ -496,6 +505,8 @@ class OptimizedDistributedQwen3Model(nn.Module):
         def init_quantized(layer):
             layer.weight_data = torch.randint(-127, 127, (layer.out_features, layer.in_features), dtype=torch.int8)
             layer.scale = torch.tensor(1.0/127.0, dtype=torch.float32)
+            # Optimization 1: Pre-dequantize for CPU performance
+            layer.float_weight = layer.weight_data.to(torch.float32) * layer.scale
             
         for layer in self.layers:
             init_quantized(layer.attention.q_proj)
@@ -698,12 +709,13 @@ def main():
     parser.add_argument("--model", type=str)
     parser.add_argument("--tokenizer", type=str)
     parser.add_argument("--num_tasks", type=int, default=1, help="Number of concurrent tasks (<= 5)")
+    parser.add_argument("--disable_tp", action="store_true", help="Disable TP all_reduce for CPU performance testing")
     parser.add_argument("--test_local", action="store_true")
     parser.add_argument("--test_4", action="store_true")
     args = parser.parse_args()
 
     if args.test_local:
-        test_local_2_devices()
+        test_local_2_devices(args)
         return
     if args.test_4:
         test_local_4_devices()
@@ -736,7 +748,8 @@ def main():
                     "master_addr": alloc["global_root_ip"].split(':')[0],
                     "master_port": 29501,
                     "world_size": len(all_devices),
-                    "num_tasks": args.num_tasks
+                    "num_tasks": args.num_tasks,
+                    "disable_tp": args.disable_tp
                 }
                 if global_rank == 0: my_config = node_config
                 else: send_config_to_node(device_ip, args.port, node_config)
@@ -755,6 +768,10 @@ def main():
             if my_config['my_rank'] in ranks: tp_group = g
 
     model_config = ModelConfig() # Default config
+    model_config.disable_tp = my_config.get('disable_tp', False)
+    if model_config.disable_tp and my_config['my_rank'] == 0:
+        logger.warning("TP All-Reduce is DISABLED for performance testing! Results may be incorrect.")
+        
     model = OptimizedDistributedQwen3Model(model_config, my_config, tp_group=tp_group)
     model.load_weights(my_config['model_path'])
     
@@ -874,58 +891,54 @@ def main():
                 step_logits[task.task_id] = logits
 
         # 2. Sample and Broadcast
-        # Note: This acts as a synchronization barrier for the pipeline batch.
-        # All tasks in this 'micro-batch' must finish their forward pass before we sample and broadcast.
-        # This is similar to GPipe's F-then-B schedule but for inference.
-        for task in tasks:
-            if task.is_complete: continue
+        # Optimization 3: Batch Broadcast for all tasks
+        num_active = len(active_tasks)
+        if num_active > 0:
+            # Payload shape: [num_active, 4]
+            # [token, step_len, task_id, is_complete]
+            batch_payload = torch.zeros((num_active, 4), dtype=torch.long)
             
-            payload = torch.zeros(4, dtype=torch.long)
             if my_config['my_rank'] == token_src_rank:
-                if task.task_id not in step_logits:
-                     # Should not happen if logic is correct
-                     logger.error(f"Missing logits for task {task.task_id}")
-                     continue
-                logits = step_logits[task.task_id]
-                next_token_val = torch.argmax(logits[:, -1, :], dim=-1).item()
-                step_len = logits.shape[1]
-                is_task_complete = 1 if task.token_count + 1 >= MAX_NEW_TOKENS else 0
-                
-                payload[0] = next_token_val
-                payload[1] = step_len
-                payload[2] = task.task_id
-                payload[3] = is_task_complete
-            
-            if HAS_DISTRIBUTED:
-                # We need to broadcast from the source rank
-                # But wait, dist.broadcast is a collective call.
-                # All ranks must call it.
-                # The source rank is token_src_rank.
-                dist.broadcast(payload, src=token_src_rank)
-            
-            token_val = payload[0].item()
-            step_len_val = payload[1].item()
-            task_id_val = payload[2].item()
-            is_complete_val = payload[3].item()
-            
-            # Sanity check
-            if task_id_val != task.task_id:
-                logger.warning(f"Rank {my_config['my_rank']} received token for task {task_id_val} but expected {task.task_id}. Order mismatch?")
+                for i, task in enumerate(active_tasks):
+                    if task.task_id not in step_logits:
+                        logger.error(f"Missing logits for task {task.task_id}")
+                        continue
+                    logits = step_logits[task.task_id]
+                    next_token_val = torch.argmax(logits[:, -1, :], dim=-1).item()
+                    step_len = logits.shape[1]
+                    is_task_complete = 1 if task.token_count + 1 >= MAX_NEW_TOKENS else 0
+                    
+                    batch_payload[i, 0] = next_token_val
+                    batch_payload[i, 1] = step_len
+                    batch_payload[i, 2] = task.task_id
+                    batch_payload[i, 3] = is_task_complete
 
-            task.start_pos += step_len_val
-            task.token_count += 1
-            if is_complete_val == 1: task.is_complete = True
+            if HAS_DISTRIBUTED:
+                dist.broadcast(batch_payload, src=token_src_rank)
             
-            if my_config['my_rank'] == 0:
-                task.generated_ids.append(token_val)
-                task.curr_input_ids = torch.tensor([[token_val]], dtype=torch.long)
-                if task.is_complete:
-                    task.end_time = time.perf_counter()
-                    print(f"\n[Rank 0] Task {task.task_id} Completed! Duration: {task.end_time - task.start_time:.2f}s")
-                    if tokenizer:
-                        # Decode and print the generated text
-                        output_text = tokenizer.decode(task.generated_ids)
-                        print(f"[Rank 0] Generated Text:\n{output_text}\n")
+            # Unpack and Update
+            for i, task in enumerate(active_tasks):
+                token_val = batch_payload[i, 0].item()
+                step_len_val = batch_payload[i, 1].item()
+                task_id_val = batch_payload[i, 2].item()
+                is_complete_val = batch_payload[i, 3].item()
+                
+                if task_id_val != task.task_id:
+                     logger.warning(f"Task ID mismatch in batch broadcast! Expected {task.task_id}, got {task_id_val}")
+                
+                task.start_pos += step_len_val
+                task.token_count += 1
+                if is_complete_val == 1: task.is_complete = True
+                
+                if my_config['my_rank'] == 0:
+                    task.generated_ids.append(token_val)
+                    task.curr_input_ids = torch.tensor([[token_val]], dtype=torch.long)
+                    if task.is_complete:
+                        task.end_time = time.perf_counter()
+                        print(f"\n[Rank 0] Task {task.task_id} Completed! Duration: {task.end_time - task.start_time:.2f}s")
+                        if tokenizer:
+                            output_text = tokenizer.decode(task.generated_ids)
+                            print(f"[Rank 0] Generated Text:\n{output_text}\n")
 
     # Print Profiler Stats for ALL ranks
     print(f"\n[Rank {my_config['my_rank']}] Performance Stats:")
@@ -934,21 +947,26 @@ def main():
     if HAS_DISTRIBUTED:
         dist.destroy_process_group()
 
-def _run_test_process(mode, ip, port, config, ips, model_path, tok_path):
+def _run_test_process(mode, ip, port, config, ips, model_path, tok_path, extra_args=[]):
     sys.argv = ["prog", "--mode", mode, "--my_ip", ip, "--port", str(port)]
     if mode == "assign":
         sys.argv.extend(["--config", config, "--ips", ips, "--model", model_path, "--tokenizer", tok_path])
+        sys.argv.extend(extra_args)
     main()
 
-def test_local_2_devices():
+def test_local_2_devices(args):
     # 2 Devices: 1@14 * 1@14
     model_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B-Q4_0/dllama_model_qwen3_0.6b_q40.m"
     tok_path = "/Users/yhbian/Library/CloudStorage/OneDrive-个人/Yanhui/杂乱/Models/Qwen-3-0.6B"
     ips = "127.0.0.1:30500,127.0.0.1:30501"
     config = "1@14*1@14"
     
-    p1 = mp.Process(target=_run_test_process, args=("listen", "127.0.0.1", 30501, None, None, None, None))
-    p0 = mp.Process(target=_run_test_process, args=("assign", "127.0.0.1", 30500, config, ips, model_path, tok_path))
+    extra = []
+    if args.disable_tp: extra.append("--disable_tp")
+    if args.num_tasks > 1: extra.extend(["--num_tasks", str(args.num_tasks)])
+    
+    p1 = mp.Process(target=_run_test_process, args=("listen", "127.0.0.1", 30501, None, None, None, None, []))
+    p0 = mp.Process(target=_run_test_process, args=("assign", "127.0.0.1", 30500, config, ips, model_path, tok_path, extra))
     
     p1.start(); time.sleep(1); p0.start()
     p0.join(); p1.join()
