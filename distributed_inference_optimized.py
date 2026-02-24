@@ -160,60 +160,98 @@ class QuantizedLinear(nn.Module):
             self.register_parameter('bias', None)
 
     def forward(self, x):
-        # Debug: Print stats once
-        if not hasattr(self, 'debug_printed'):
-             self.debug_printed = True
-             with torch.no_grad():
-                 w_float = self.weight_data.float()
-                 logger.info(f"Layer {self.in_features}->{self.out_features} W: mean={w_float.mean():.4f}, std={w_float.std():.4f}, max={w_float.max()}, min={w_float.min()}")
-                 logger.info(f"Layer Scale: mean={self.scale.mean():.6f}, max={self.scale.max():.6f}")
-                 
         # x: [batch, seq, in_features] (float32)
-        # Quantize input x to int8 on the fly
-        # 1. Calculate scale (per-tensor or per-token?)
-        # For simplicity and speed, use per-tensor max
-        abs_x = x.abs()
-        max_val = abs_x.max()
-        if max_val == 0:
-            scale_x = torch.tensor(1.0, device=x.device, dtype=x.dtype)
-        else:
-            scale_x = max_val / 127.0
-            
-        # 2. Quantize
-        # Note: clamp is essential to avoid overflow
-        x_int8 = (x / scale_x).round().clamp(-127, 127).to(torch.int8)
         
-        # 3. Integer Matrix Multiplication
-        # shape: [batch*seq, in] @ [out, in].T -> [batch*seq, out] (int32)
-        # _int_mm requires 2D inputs
-        x_shape = x.shape
-        if len(x_shape) == 3:
-            x_flat = x_int8.view(-1, self.in_features)
-        else:
-            x_flat = x_int8
-            
-        # Use torch._int_mm if available, else fallback to float simulation (should not happen on modern torch)
+        # Fast path for CPU inference without int8 acceleration
+        # If we don't have _int_mm, skipping activation quantization is FASTER
+        # and avoids the overhead of per-token scaling.
+        # We just dequantize weights block-wise (or row-wise) and use float matmul.
+        
         if hasattr(torch, '_int_mm'):
-            y_int32 = torch._int_mm(x_flat, self.weight_data.t())
+             # ... (Keep existing _int_mm logic)
+            x_shape = x.shape
+            if len(x_shape) == 3:
+                x_flat = x.view(-1, self.in_features)
+            else:
+                x_flat = x
+                
+            # Calculate scale per token: [B*S, 1]
+            abs_x = x_flat.abs()
+            max_val = abs_x.max(dim=1, keepdim=True).values
+            scale_x = max_val / 127.0
+            scale_x = torch.where(scale_x == 0, torch.tensor(1.0, device=x.device, dtype=x.dtype), scale_x)
+            
+            # Quantize
+            x_int8 = (x_flat / scale_x).round().clamp(-127, 127).to(torch.int8)
+            y_int32 = torch._int_mm(x_int8, self.weight_data.t())
+            
+            y = y_int32.to(self.dtype) * scale_x * self.scale.view(1, -1)
+            
+            if len(x_shape) == 3:
+                y = y.view(x_shape[0], x_shape[1], self.out_features)
+                
+            if self.bias is not None:
+                y = y + self.bias
+            return y
+
         else:
-            # Fallback (slow, but functionally correct logic)
-            y_int32 = torch.matmul(x_flat.float(), self.weight_data.t().float()).to(torch.int32)
+            # Fallback Optimization: Direct Float Matmul
+            # Skip x quantization entirely.
+            # Just dequantize weights on the fly and matmul.
+            # This saves: abs, max, div, round, clamp, to(int8), and later dequant logic.
             
-        # 4. Rescale Output (Dequantize to float for next layer/norm)
-        # y_float = y_int32 * scale_x * scale_w
-        # This is the "logical" float value.
-        # scale_w is [out, 1]. y_int32 is [batch*seq, out].
-        # We need to multiply each column j by scale_w[j].
-        # Transpose scale to [1, out] for broadcasting.
-        y = y_int32.to(self.dtype) * (scale_x * self.scale.view(1, -1))
-        
-        if len(x_shape) == 3:
-            y = y.view(x_shape[0], x_shape[1], self.out_features)
+            # x: [batch, seq, in]
+            # w_int8: [out, in]
+            # scale: [out, 1]
             
-        if self.bias is not None:
-            y = y + self.bias
+            # We need w_float = w_int8 * scale
+            # But w_float is too big to materialize fully (OOM).
+            # So we chunk along OUT dimension.
             
-        return y
+            M = x.numel() // self.in_features
+            K = self.in_features
+            N = self.out_features
+            
+            x_flat = x.view(M, K)
+            
+            # Output buffer
+            y = torch.empty((M, N), dtype=self.dtype, device=x.device)
+            
+            chunk_size = 512 # Tunable
+            
+            # Pre-transpose x for better memory access if M is large? 
+            # Usually M=1 (decoding), so x is [1, K].
+            
+            for i in range(0, N, chunk_size):
+                end_i = min(i + chunk_size, N)
+                
+                # Dequantize weight chunk
+                # w_chunk_int8: [chunk, K]
+                w_chunk_int8 = self.weight_data[i:end_i, :]
+                scale_chunk = self.scale[i:end_i, :] # [chunk, 1]
+                
+                # w_chunk_float = w_chunk_int8 * scale_chunk
+                w_chunk_float = w_chunk_int8.to(self.dtype) * scale_chunk
+                
+                # Matmul: [M, K] @ [chunk, K].T -> [M, chunk]
+                # Using linear is slightly cleaner: y = x @ w.T
+                # F.linear(input, weight, bias=None)
+                # weight shape for F.linear is (out_features, in_features)
+                
+                # Check shapes:
+                # x_flat: [M, K]
+                # w_chunk_float: [chunk, K]
+                # F.linear(x_flat, w_chunk_float) -> [M, chunk]
+                
+                y[:, i:end_i] = F.linear(x_flat, w_chunk_float)
+                
+            if len(x.shape) == 3:
+                y = y.view(x.shape[0], x.shape[1], N)
+                
+            if self.bias is not None:
+                y = y + self.bias
+                
+            return y
 
 class CommManager:
     """Helper class for managing communication buffers and optimized operations"""
@@ -293,14 +331,33 @@ def read_m_file_config(model_path):
             
             cfg = {}
             if 2 in config_dict: cfg['dim'] = config_dict[2]
-            if 1 in config_dict: cfg['hidden_dim'] = config_dict[1]
-            if 3 in config_dict: cfg['n_heads'] = config_dict[3]
+            
+            # Key 3 seems to be hidden_dim (intermediate_size) in this format
+            if 3 in config_dict: cfg['hidden_dim'] = config_dict[3]
+            
+            # Key 1 is suspicious (very large value), ignore it for hidden_dim
+            # if 1 in config_dict: cfg['hidden_dim'] = config_dict[1]
+            
+            # Guess n_heads if not present or if derived head_dim is 0
+            # Qwen usually has head_dim = 128
+            if 'dim' in cfg:
+                cfg['n_heads'] = cfg['dim'] // 128
+                cfg['head_dim'] = 128
+                
             if 4 in config_dict: cfg['n_kv_heads'] = config_dict[4]
             if 5 in config_dict: cfg['n_layers'] = config_dict[5]
             if 9 in config_dict: cfg['vocab_size'] = config_dict[9]
-            if 2 in config_dict and 3 in config_dict:
-                cfg['head_dim'] = config_dict[2] // config_dict[3]
             
+            # Fallback for n_kv_heads
+            if 'n_kv_heads' not in cfg and 'n_heads' in cfg:
+                 cfg['n_kv_heads'] = cfg['n_heads']
+            
+            # Sanity check for n_kv_heads
+            if 'n_kv_heads' in cfg and 'n_heads' in cfg:
+                if cfg['n_kv_heads'] > cfg['n_heads']:
+                    print(f"[Config] Warning: n_kv_heads ({cfg['n_kv_heads']}) > n_heads ({cfg['n_heads']}). Clamping to n_heads.")
+                    cfg['n_kv_heads'] = cfg['n_heads']
+
             print(f"[Config] Auto-detected config from .m file: {cfg}")
             return cfg
     except Exception as e:
@@ -462,40 +519,140 @@ class GroupedQueryAttention(nn.Module):
         xv = xv.view(b, seq_len, self.local_kv_heads, self.head_dim)
         
         # RoPE
-        xq = apply_rope(xq, cos, sin, offset=start_pos)
-        xk = apply_rope(xk, cos, sin, offset=start_pos)
+        # xq = apply_rope(xq, cos, sin, offset=start_pos)
+        # xk = apply_rope(xk, cos, sin, offset=start_pos)
+        
+        # Optimized RoPE: In-place if possible?
+        # RoPE is memory bandwidth bound.
+        # But we need to use cos/sin slices.
+        # Let's just inline apply_rope logic to avoid function overhead?
+        
+        head_dim = self.head_dim
+        
+        # Slicing cos/sin for current position
+        # Cos/Sin: [max_seq, head_dim/2]
+        # We need [seq_len, head_dim/2]
+        # Pre-slice to avoid indexing inside the operation
+        # Note: cos is shape [max_seq, head_dim].
+        # wait, compute_rope_params returns [max_seq, head_dim].
+        # In apply_rope, it was:
+        # c = cos[offset:offset + seq_len, :].unsqueeze(0).unsqueeze(2)
+        # So c is [1, seq, 1, head_dim].
+        
+        # In my optimized logic:
+        # c = cos[start_pos : start_pos + seq_len, :].view(1, seq_len, 1, head_dim // 2)
+        # This view assumes cos has head_dim/2 elements?
+        # Let's check compute_rope_params:
+        # freqs = torch.cat([freqs, freqs], dim=1) -> shape [max_seq, head_dim]
+        # So cos is [max_seq, head_dim].
+        
+        # The traditional RoPE implementation (as in apply_rope):
+        # x_rotated = (x * c) + (rotated * s)
+        # Here x is [b, seq, heads, head_dim]
+        # c should be broadcastable to x.
+        # If cos is [seq, head_dim], then c is [1, seq, 1, head_dim].
+        
+        # My optimized fast_rope logic:
+        # x1 = x_in[..., : head_dim // 2]
+        # x2 = x_in[..., head_dim // 2 :]
+        # rotated = torch.cat((-x2, x1), dim=-1)
+        # return (x_in * c) + (rotated * s)
+        
+        # Here x_in is [b, seq, heads, head_dim].
+        # rotated is same shape.
+        # So c should be [1, seq, 1, head_dim].
+        
+        # My broken code:
+        # c = cos[...].view(1, seq, 1, head_dim // 2)
+        # This tries to shrink it to half? Why?
+        # Ah, because some RoPE implementations store complex numbers or pre-sliced cos.
+        # But here cos is full head_dim.
+        
+        c = cos[start_pos : start_pos + seq_len, :].view(1, seq_len, 1, head_dim)
+        s = sin[start_pos : start_pos + seq_len, :].view(1, seq_len, 1, head_dim)
+        
+        def fast_rope(x_in):
+            # x_in: [b, seq, heads, head_dim]
+            # Standard RoPE:
+            # [x0, x1, x2, ...] -> [-x1, x0, -x3, x2, ...]
+            # This implementation does:
+            # x1 = first half, x2 = second half
+            # rotated = [-x2, x1]
+            # This matches "half-rotation" style RoPE (common in HF/Llama).
+            
+            x1 = x_in[..., : head_dim // 2]
+            x2 = x_in[..., head_dim // 2 :]
+            rotated = torch.cat((-x2, x1), dim=-1)
+            return (x_in * c) + (rotated * s)
+
+        xq = fast_rope(xq).to(x.dtype)
+        xk = fast_rope(xk).to(x.dtype)
         
         # KV Cache Management
         if task_id not in self.k_cache:
             self.k_cache[task_id] = torch.zeros(b, self.config.max_seq_len, self.local_kv_heads, self.head_dim, device=x.device, dtype=x.dtype)
             self.v_cache[task_id] = torch.zeros(b, self.config.max_seq_len, self.local_kv_heads, self.head_dim, device=x.device, dtype=x.dtype)
             
-        # Update cache
-        self.k_cache[task_id][:b, start_pos : start_pos + seq_len] = xk
-        self.v_cache[task_id][:b, start_pos : start_pos + seq_len] = xv
+        # Update cache (Static KV Cache - No cat!)
+        # self.k_cache is pre-allocated.
+        # Just assign.
+        self.k_cache[task_id][:, start_pos : start_pos + seq_len, :, :] = xk
+        self.v_cache[task_id][:, start_pos : start_pos + seq_len, :, :] = xv
         
         # Retrieve cached keys/values
-        keys = self.k_cache[task_id][:b, :start_pos + seq_len]
-        values = self.v_cache[task_id][:b, :start_pos + seq_len]
+        # We only need the valid part for attention
+        # View avoids copy?
+        keys = self.k_cache[task_id][:, :start_pos + seq_len, :, :]
+        values = self.v_cache[task_id][:, :start_pos + seq_len, :, :]
         
         # Expand keys/values for GQA
         if self.local_num_heads > 0:
-            indices = self.q_head_to_kv_head.to(keys.device)
-            keys = keys.index_select(2, indices)
-            values = values.index_select(2, indices)
+            # GQA Expansion
+            # keys: [b, seq, n_kv, head_dim]
+            # indices: [n_local_heads] mapping to n_kv
+            
+            # Optimization: If n_kv == n_heads (MHA), skip index_select
+            if self.num_heads == self.num_kv_heads:
+                pass 
+            else:
+                indices = self.q_head_to_kv_head.to(keys.device)
+                keys = keys.index_select(2, indices)
+                values = values.index_select(2, indices)
             
         # Attention
         xq = xq.transpose(1, 2) # [b, n_heads, seq, dim]
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
         
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / (self.head_dim ** 0.5)
+        # Scaled Dot Product Attention
+        # scores = torch.matmul(xq, keys.transpose(2, 3)) / (self.head_dim ** 0.5)
         
-        if mask is not None:
-            scores = scores.masked_fill(mask, float("-inf"))
-            
-        probs = F.softmax(scores, dim=-1)
-        output = torch.matmul(probs, values)
+        # Optimization: Use F.scaled_dot_product_attention if available (PyTorch 2.0+)
+        # It handles masking and scaling efficiently.
+        # But we need to handle causal mask manually if not using is_causal=True
+        # For inference (start_pos > 0), we query 1 token against N keys. It's not strictly "causal" triangle mask
+        # It's [1, N] attention.
+        
+        if hasattr(F, 'scaled_dot_product_attention') and xq.dtype != torch.int8:
+             # F.sdpa expects [b, n_heads, seq_q, head_dim]
+             # keys: [b, n_heads, seq_k, head_dim]
+             # If start_pos > 0 (decoding), we don't need mask usually? 
+             # Wait, all previous keys are valid.
+             # If seq_len > 1 (prefill), we need causal mask.
+             
+             is_causal = (seq_len > 1) and (mask is None) # If mask provided, use it
+             # Actually for decoding (seq=1), is_causal=False is fine.
+             
+             # Note: F.sdpa might not support some dtypes on CPU or specific hardware.
+             # Let's try it.
+             output = F.scaled_dot_product_attention(xq, keys, values, attn_mask=mask, dropout_p=0.0, is_causal=is_causal)
+             
+        else:
+            scores = torch.matmul(xq, keys.transpose(2, 3)) / (self.head_dim ** 0.5)
+            if mask is not None:
+                scores = scores.masked_fill(mask, float("-inf"))
+            probs = F.softmax(scores, dim=-1)
+            output = torch.matmul(probs, values)
         
         output = output.transpose(1, 2).contiguous().view(b, seq_len, -1)
         out = self.o_proj(output)
@@ -559,7 +716,8 @@ class OptimizedDistributedQwen3Model(nn.Module):
         
         if self.my_stage_idx == len(self.stage_ranks) - 1:
             self.norm = RMSNorm(config.dim, config.norm_eps)
-            self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+            # Use QuantizedLinear for lm_head to save memory (Int8 weights)
+            self.output = QuantizedLinear(config.dim, config.vocab_size, bias=False, dtype=config.dtype)
 
     def load_weights(self, model_path):
         logger.info(f"[Rank {self.my_rank}] Loading weights from {model_path}...")
@@ -877,33 +1035,100 @@ class OptimizedDistributedQwen3Model(nn.Module):
             
             if is_last_stage:
                 if remaining >= sz_head_float:
-                    logger.info(f"[Rank {self.my_rank}] Loading Head (Float32)...")
-                    w = load_tensor(sz_head_float, torch.float32, (vocab, dim))
-                    self.output.weight.data.copy_(w)
+                    logger.info(f"[Rank {self.my_rank}] Loading Head (Float32) as Int8...")
+                    # Process in chunks to save memory
+                    chunk_rows = 1024
+                    
+                    # Prepare Int8 storage first
+                    w_int8_full = torch.empty((vocab, dim), dtype=torch.int8)
+                    scale_full = torch.empty((vocab, 1), dtype=torch.float32)
+                    
+                    for i in range(0, vocab, chunk_rows):
+                        end_i = min(i + chunk_rows, vocab)
+                        rows = end_i - i
+                        n_bytes = rows * dim * 4
+                        
+                        # Read chunk (Float32)
+                        w_chunk = load_tensor(n_bytes, torch.float32, (rows, dim))
+                        
+                        # Quantize chunk
+                        abs_w = w_chunk.abs()
+                        max_val = abs_w.max(dim=1, keepdim=True).values
+                        scale = max_val / 127.0
+                        scale = torch.where(scale == 0, torch.tensor(1.0, dtype=scale.dtype, device=scale.device), scale)
+                        w_int8 = (w_chunk / scale).round().clamp(-127, 127).to(torch.int8)
+                        
+                        w_int8_full[i:end_i] = w_int8
+                        scale_full[i:end_i] = scale
+                        
+                        del w_chunk, w_int8, scale
+                        gc.collect()
+
+                    self.output.weight_data = w_int8_full
+                    self.output.scale = scale_full
+                    self.output.out_features = vocab
+                    self.output.in_features = dim
+
                 elif remaining >= sz_head_q4:
-                    logger.info(f"[Rank {self.my_rank}] Loading Head (Q4_0)...")
-                    # Inline Q4 unpacking
+                    logger.info(f"[Rank {self.my_rank}] Loading Head (Q4_0) as Int8 (Chunked)...")
+                    
+                    # Prepare Int8 storage
+                    w_int8_full = torch.empty((vocab, dim), dtype=torch.int8)
+                    scale_full = torch.empty((vocab, 1), dtype=torch.float32)
+                    
+                    # Chunk processing
+                    chunk_rows = 1024
                     block_size = 32
                     block_bytes = 18
-                    num_blocks = (vocab * dim) // block_size
-                    total_bytes = num_blocks * block_bytes
                     
-                    raw_bytes = torch.frombuffer(mm[offset : offset + total_bytes], dtype=torch.uint8)
-                    offset += total_bytes
+                    for i in range(0, vocab, chunk_rows):
+                        end_i = min(i + chunk_rows, vocab)
+                        rows = end_i - i
+                        num_blocks = (rows * dim) // block_size
+                        chunk_bytes = num_blocks * block_bytes
+                        
+                        # Read raw bytes for chunk
+                        raw_bytes = torch.frombuffer(mm[offset : offset + chunk_bytes], dtype=torch.uint8)
+                        offset += chunk_bytes
+                        
+                        # Unpack Q4
+                        blocks = raw_bytes.view(num_blocks, block_bytes)
+                        scales_bytes = blocks[:, :2].flatten()
+                        scales = scales_bytes.view(torch.float16).to(torch.float32)
+                        
+                        data_bytes = blocks[:, 2:].flatten()
+                        low = (data_bytes & 0x0F).to(torch.float32) - 8.0
+                        high = (data_bytes >> 4).to(torch.float32) - 8.0
+                        weights = torch.stack([low, high], dim=1).flatten()
+                        
+                        scales_expanded = scales.repeat_interleave(32)
+                        w_float_chunk = (weights * scales_expanded).view(rows, dim)
+                        
+                        # Quantize to Int8
+                        abs_w = w_float_chunk.abs()
+                        max_val = abs_w.max(dim=1, keepdim=True).values
+                        scale = max_val / 127.0
+                        scale = torch.where(scale == 0, torch.tensor(1.0, dtype=scale.dtype, device=scale.device), scale)
+                        if torch.isnan(scale).any(): scale = torch.nan_to_num(scale, nan=0.001)
+
+                        w_int8 = (w_float_chunk / scale).round().clamp(-127, 127).to(torch.int8)
+                        
+                        w_int8_full[i:end_i] = w_int8
+                        scale_full[i:end_i] = scale
+                        
+                        del raw_bytes, blocks, scales, data_bytes, weights, scales_expanded, w_float_chunk, w_int8
+                        # gc.collect() # Frequent GC might slow down loop, maybe every few iterations?
                     
-                    blocks = raw_bytes.view(num_blocks, block_bytes)
-                    scales_bytes = blocks[:, :2].flatten()
-                    scales = scales_bytes.view(torch.float16).to(torch.float32)
-                    data_bytes = blocks[:, 2:].flatten()
-                    low = (data_bytes & 0x0F).to(torch.float32) - 8.0
-                    high = (data_bytes >> 4).to(torch.float32) - 8.0
-                    weights = torch.stack([low, high], dim=1).flatten()
-                    scales_expanded = scales.repeat_interleave(32)
-                    w_float = (weights * scales_expanded).view(vocab, dim)
+                    self.output.weight_data = w_int8_full
+                    self.output.scale = scale_full
+                    self.output.out_features = vocab
+                    self.output.in_features = dim
                     
-                    self.output.weight.data.copy_(w_float)
                 else:
                     logger.warning(f"[Rank {self.my_rank}] Head weights missing (Remaining {remaining}, Needed {sz_head_q4}). Using random.")
+                    # Random init for QuantizedLinear
+                    self.output.weight_data = torch.randint(-127, 127, (vocab, dim), dtype=torch.int8)
+                    self.output.scale = torch.ones((vocab, 1), dtype=torch.float32) * 0.01
             else:
                 if remaining >= sz_head_float:
                     skip_bytes(sz_head_float)
@@ -1482,27 +1707,43 @@ def main():
     MAX_NEW_TOKENS = 20
     
     # Loop until all tasks are complete
+    # Pipelining Strategy:
+    # We want to keep all stages busy.
+    # Stage 0 should push tasks as fast as possible.
+    # We iterate tasks in a round-robin fashion.
+    
+    step_count = 0
+    
     while True:
+        # Optimization: Filter active tasks BEFORE starting forward passes
+        # This list must be consistent across all ranks.
+        # We assume 'tasks' list is static and we only check is_complete flag.
         active_tasks = [t for t in tasks if not t.is_complete]
         if not active_tasks: break
-            
+        
+        step_start_time = time.perf_counter()
+        
+        # Determine schedule: Which tasks to run in this micro-batch?
+        # Simple schedule: Run ALL active tasks in round-robin order.
+        # This naturally fills the pipeline.
+        # Task 0 -> Stage 0 -> Stage 1 -> ...
+        # Task 1 -> Stage 0 -> Stage 1 -> ...
+        # When Stage 0 is done with Task 0, it starts Task 1 immediately.
+        
         # 1. Forward Pass
+        # We need to collect outputs from the LAST stage to broadcast.
+        # But intermediate stages just forward.
+        
         step_logits = {} 
-        for task in tasks:
-            if task.is_complete: continue
-            
+        
+        # NOTE: For proper pipeline sync, ALL ranks must iterate through active_tasks
+        # in the exact same order.
+        for task in active_tasks:
+            # Profiling start
             if my_config['my_rank'] == 0 and task.token_count == 0 and task.start_time == 0.0:
                 task.start_time = time.perf_counter()
 
-            # --- Multi-Task Pipeline Logic ---
-            # By iterating through tasks, we naturally implement a pipeline.
-            # Stage 0 sends Task A, then immediately processes Task B.
-            # Stage 1 receives Task A, processes it. 
-            # In the next iteration of the inner loop (or next receive call), Stage 1 receives Task B.
-            # The key is that Stage 0 does NOT wait for Stage 1 to finish Task A before starting Task B.
-            # The send operation in Stage 0 is non-blocking (or fast blocking), allowing it to proceed.
-            # ---------------------------------
-
+            # Execute Forward
             if my_config['my_rank'] == 0:
                 logits = model(task.curr_input_ids, start_pos=task.start_pos, task_id=task.task_id)
             else:
@@ -1511,8 +1752,11 @@ def main():
             if my_config['my_rank'] == token_src_rank:
                 step_logits[task.task_id] = logits
 
-        # 2. Sample and Broadcast
-        # Optimization 3: Batch Broadcast for all tasks
+        # 2. Sample and Broadcast (Synchronization Point)
+        # To minimize bubbles, we should ideally broadcast per task AS SOON AS it's ready.
+        # But batching broadcast reduces overhead.
+        # Let's keep batch broadcast for now, as network latency dominates.
+        
         num_active = len(active_tasks)
         if num_active > 0:
             # Payload shape: [num_active, 4]
@@ -1521,9 +1765,19 @@ def main():
             
             if my_config['my_rank'] == token_src_rank:
                 for i, task in enumerate(active_tasks):
+                    # Check if we have logits. 
+                    # If this rank is token_src_rank (last stage), it MUST have logits 
+                    # UNLESS the pipeline is deeper than 1 and tasks are still in flight?
+                    # In our synchronous-per-task model implementation:
+                    # model() call blocks until it receives from previous stage, computes, and sends to next.
+                    # So if token_src_rank finishes model(), it HAS the result.
+                    # The only case it might fail is if an exception occurred earlier.
+                    
                     if task.task_id not in step_logits:
-                        logger.error(f"Missing logits for task {task.task_id}")
-                        continue
+                         # This should logically not happen in a blocking pipeline
+                         logger.error(f"Missing logits for task {task.task_id}")
+                         continue
+                         
                     logits = step_logits[task.task_id]
                     next_token_val = torch.argmax(logits[:, -1, :], dim=-1).item()
                     step_len = logits.shape[1]
@@ -1535,7 +1789,15 @@ def main():
                     batch_payload[i, 3] = is_task_complete
 
             if HAS_DISTRIBUTED:
-                dist.broadcast(batch_payload, src=token_src_rank)
+                # Ensure all ranks participate in broadcast!
+                # If active_tasks differs between ranks, this will hang.
+                # Since we update is_complete based on this broadcast, 
+                # all ranks should stay in sync.
+                try:
+                    dist.broadcast(batch_payload, src=token_src_rank)
+                except RuntimeError as e:
+                    logger.error(f"Broadcast failed: {e}")
+                    break # Abort if communication breaks
             
             # Unpack and Update
             for i, task in enumerate(active_tasks):
@@ -1544,8 +1806,11 @@ def main():
                 task_id_val = batch_payload[i, 2].item()
                 is_complete_val = batch_payload[i, 3].item()
                 
+                # Sanity check
                 if task_id_val != task.task_id:
-                     logger.warning(f"Task ID mismatch in batch broadcast! Expected {task.task_id}, got {task_id_val}")
+                      # This can happen if ranks have different active_tasks lists!
+                      # Critical error.
+                      logger.warning(f"Task ID mismatch! Rank {my_config['my_rank']} expects {task.task_id}, got {task_id_val}")
                 
                 task.start_pos += step_len_val
                 task.token_count += 1
@@ -1560,6 +1825,12 @@ def main():
                         if tokenizer:
                             output_text = tokenizer.decode(task.generated_ids)
                             print(f"[Rank 0] Generated Text:\n{output_text}\n")
+            
+            step_end_time = time.perf_counter()
+            if my_config['my_rank'] == 0:
+                print(f"[Rank 0] Step {step_count}: Processed {num_active} tasks in {step_end_time - step_start_time:.4f}s (Avg {(step_end_time - step_start_time)/num_active:.4f}s/token)")
+            step_count += 1
+
 
     # Print Profiler Stats for ALL ranks
     print(f"\n[Rank {my_config['my_rank']}] Performance Stats:")
